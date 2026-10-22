@@ -40,6 +40,12 @@ changelog entry.
 
 ## Unreleased
 
+### Added
+
+- Add byte and time limits for incoming data transfers, implemented on Wayland.
+- On Wayland, add optional portal file retrieval after a drop.
+
 ### Fixed
 
 - On Wayland, recognize UTF-8 text transfers regardless of MIME parameter whitespace, quoting, or case.
+- On Wayland, retain dropped transfers while a new drag enters and only finish successful transfers.
