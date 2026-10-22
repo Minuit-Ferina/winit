@@ -39,3 +39,7 @@ The migration guide could reference other migration examples in the current
 changelog entry.
 
 ## Unreleased
+
+### Fixed
+
+- On Wayland, recognize UTF-8 text transfers regardless of MIME parameter whitespace, quoting, or case.
