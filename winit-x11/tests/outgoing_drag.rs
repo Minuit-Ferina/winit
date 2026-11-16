@@ -11,6 +11,7 @@ use winit_core::data_transfer::{DataTransferId, DataTransferSendBuilder, TypeHin
 use winit_core::event::{ButtonSource, ElementState, MouseButton, WindowEvent};
 use winit_core::event_loop::{ActiveEventLoop, ControlFlow, DndAction};
 use winit_core::window::{Window, WindowAttributes, WindowId};
+use winit_x11::ActiveEventLoopExtX11 as _;
 use x11rb::connection::Connection as _;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
@@ -25,6 +26,7 @@ fn completes_and_cancels_drags_between_x11_windows() {
         Scenario::Copy,
         Scenario::CopyAcrossGap,
         Scenario::CopyAcrossOverlap,
+        Scenario::CopyWithinSource,
         Scenario::Reject,
         Scenario::Escape,
         Scenario::Copy,
@@ -55,13 +57,17 @@ enum Scenario {
     Copy,
     CopyAcrossGap,
     CopyAcrossOverlap,
+    CopyWithinSource,
     Reject,
     Escape,
 }
 
 impl Scenario {
     fn copies(self) -> bool {
-        matches!(self, Self::Copy | Self::CopyAcrossGap | Self::CopyAcrossOverlap)
+        matches!(
+            self,
+            Self::Copy | Self::CopyAcrossGap | Self::CopyAcrossOverlap | Self::CopyWithinSource
+        )
     }
 
     fn target_x(self) -> i32 {
@@ -157,10 +163,10 @@ impl ApplicationHandler for DragTest {
                 "sleep",
                 "0.1",
                 "mousemove",
-                if matches!(scenario, Scenario::CopyAcrossGap | Scenario::CopyAcrossOverlap) {
-                    "222"
-                } else {
-                    "400"
+                match scenario {
+                    Scenario::CopyAcrossGap | Scenario::CopyAcrossOverlap => "222",
+                    Scenario::CopyWithinSource => "150",
+                    _ => "400",
                 },
                 "90",
                 "sleep",
@@ -202,6 +208,13 @@ impl ApplicationHandler for DragTest {
         let destination =
             self.destination.as_ref().is_some_and(|destination| destination.id() == window);
 
+        let target = if self.scenario == Scenario::CopyWithinSource { source } else { destination };
+        let start_x = if event_loop.is_xwayland() || self.scenario == Scenario::CopyWithinSource {
+            75.0
+        } else {
+            180.0
+        };
+
         match event {
             WindowEvent::PointerButton {
                 button: ButtonSource::Mouse(MouseButton::Left),
@@ -214,7 +227,7 @@ impl ApplicationHandler for DragTest {
                 if source
                     && self.pointer_down
                     && self.transfer.is_none()
-                    && position.x >= 180.0 =>
+                    && position.x >= start_x =>
             {
                 let data = DataTransferSendBuilder::new(PAYLOAD)
                     .with_type(TypeHint::Plaintext, |value, _| Some(value.to_string()))
@@ -222,7 +235,7 @@ impl ApplicationHandler for DragTest {
                 self.transfer =
                     Some(event_loop.start_drag(window, data, &[DndAction::Copy], None).unwrap());
             },
-            WindowEvent::DragPosition { id, .. } if destination => {
+            WindowEvent::DragPosition { id, .. } if target => {
                 self.visited_destination = true;
                 let actions = if self.scenario == Scenario::Reject {
                     &[][..]
@@ -231,11 +244,11 @@ impl ApplicationHandler for DragTest {
                 };
                 event_loop.set_valid_dnd_actions(id, actions).unwrap();
             },
-            WindowEvent::DragDropped { id, .. } if destination => {
+            WindowEvent::DragDropped { id, .. } if target => {
                 assert!(self.scenario.copies());
                 event_loop.fetch_data_transfer(id, &TypeHint::Plaintext).unwrap();
             },
-            WindowEvent::DataTransferReceived { value, .. } if destination => {
+            WindowEvent::DataTransferReceived { value, .. } if target => {
                 self.received = Some(value.try_as_string().unwrap());
             },
             WindowEvent::OutgoingDragDropped { id, action } if source => {

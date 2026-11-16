@@ -117,12 +117,19 @@ pub fn register_xlib_error_hook(hook: XlibErrorHook) {
 pub trait ActiveEventLoopExtX11 {
     /// True if the event loop uses X11.
     fn is_x11(&self) -> bool;
+
+    /// True if the X11 backend is connected to a server advertising the XWAYLAND extension.
+    fn is_xwayland(&self) -> bool;
 }
 
 impl ActiveEventLoopExtX11 for dyn CoreActiveEventLoop + '_ {
     #[inline]
     fn is_x11(&self) -> bool {
         self.cast_ref::<ActiveEventLoop>().is_some()
+    }
+
+    fn is_xwayland(&self) -> bool {
+        self.cast_ref::<ActiveEventLoop>().is_some_and(|event_loop| event_loop.xconn.is_xwayland())
     }
 }
 

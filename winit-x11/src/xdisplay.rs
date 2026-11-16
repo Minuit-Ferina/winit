@@ -226,6 +226,10 @@ impl XConnection {
         self.randr_version
     }
 
+    pub(crate) fn is_xwayland(&self) -> bool {
+        self.xcb_connection().extension_information("XWAYLAND").ok().flatten().is_some()
+    }
+
     /// Get the underlying XCB connection.
     #[inline]
     pub fn xcb_connection(&self) -> &XCBConnection {
