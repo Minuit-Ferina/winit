@@ -605,6 +605,10 @@ impl RootActiveEventLoop for ActiveEventLoop {
         allowed_actions: &[DndAction],
         icon: Option<DragIcon>,
     ) -> Result<DataTransferId, TransferError> {
+        if self.0.source_drag.get().is_some() || self.0.pending_drag.borrow().is_some() {
+            return Err(TransferError::Failed);
+        }
+
         let allowed_effects = crate::data_transfer::dnd_actions_to_dropeffect_mask(allowed_actions);
         // Win32 would happily run a modal `DoDragDrop` with `allowed_effects == 0`, but every
         // target would see "no action allowed" and the drag would end in a guaranteed cancel
@@ -1386,14 +1390,6 @@ unsafe fn public_window_callback_inner(
             result = ProcResult::Value(0);
         },
 
-        WM_PAINT if userdata.event_loop_runner.source_drag.get().is_some() => {
-            // While a source-side drag is in flight, the app handler is on the stack (we're
-            // inside `start_drag` -> `DoDragDrop`), so we can neither dispatch `RedrawRequested`
-            // nor keep re-arming via `RDW_INTERNALPAINT` (that would spin in OLE's modal loop).
-            // Let `DefWindowProcW` validate the region and show stale content for the duration of
-            // the drag; the next real paint happens once `DoDragDrop` returns.
-            result = ProcResult::Value(unsafe { DefWindowProcW(window, msg, wparam, lparam) });
-        },
         WM_PAINT => {
             userdata.window_state_lock().redraw_requested =
                 userdata.event_loop_runner.should_buffer();

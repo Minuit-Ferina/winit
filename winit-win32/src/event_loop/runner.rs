@@ -146,6 +146,12 @@ impl EventLoopRunner {
     }
 
     pub(super) fn try_execute_drag_drop(self: &Rc<Self>) {
+        // A nested window procedure can run while an application callback
+        // is still on the stack. Wait until the handler is available so the
+        // OLE loop can deliver hover and redraw events during this drag.
+        if self.should_buffer() || self.source_drag.get().is_some() {
+            return;
+        }
         let Some(PendingDrag { data_object, drop_source, id, allowed_effects, window_id }) =
             self.pending_drag.take()
         else {
@@ -155,8 +161,7 @@ impl EventLoopRunner {
         // Make the drag visible to our own target-side `IDropTarget` so it can recognize
         // self-drops and reuse this id + action mask without going through the (buffered) app
         // handler. The guard ensures the flag is cleared on any exit path - if anything between
-        // here and `DoDragDrop`'s return panics, the stale flag would otherwise permanently
-        // disable `WM_PAINT` dispatch and misclassify all future external drags as self-drops.
+        // here and DoDragDrop's return panics, a stale flag would misclassify later drags.
         struct ClearOnDrop<'a>(&'a Cell<Option<SourceDrag>>);
         impl Drop for ClearOnDrop<'_> {
             fn drop(&mut self) {
@@ -183,14 +188,14 @@ impl EventLoopRunner {
                 window_id,
                 event: WindowEvent::OutgoingDragDropped { id, action },
             });
-        } else if hr == DRAGDROP_S_CANCEL {
+        } else {
+            if hr != DRAGDROP_S_CANCEL {
+                tracing::error!("DoDragDrop failed: 0x{hr:08x}");
+            }
             self.send_event(Event::Window {
                 window_id,
                 event: WindowEvent::OutgoingDragCanceled { id },
             });
-        } else {
-            tracing::error!("DoDragDrop failed: 0x{hr:08x}");
-            return;
         }
 
         // Both `DRAGDROP_S_DROP` and `DRAGDROP_S_CANCEL` are success codes for us - the app
