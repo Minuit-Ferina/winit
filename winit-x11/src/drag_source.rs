@@ -156,6 +156,7 @@ impl DragSource {
                 .check()?;
         }
 
+        debug!(source, device, borderless = source_borderless, "XDND source started");
         drag.motion(
             (pointer.root_x >> 16) as i16,
             (pointer.root_y >> 16) as i16,
@@ -190,14 +191,26 @@ impl DragSource {
             return Ok(());
         }
         let position = Position { x, y, time };
-        let target = target_at(
-            &self.xconn,
-            self.root,
-            position,
-            self.source_borderless.then_some(self.source),
-        );
+        let top = child_at(&self.xconn, self.root, self.root, position);
+        let target = top.and_then(|frame| {
+            target_at(
+                &self.xconn,
+                self.root,
+                frame,
+                position,
+                self.source_borderless.then_some(self.source),
+            )
+        });
 
+        trace!(source = self.source, x, y, ?top, ?target, "XDND source hit test");
         if self.hover.as_ref().map(|hover| hover.target) != target {
+            debug!(
+                source = self.source,
+                ?target,
+                x,
+                y,
+                "XDND source changed target"
+            );
             self.leave();
             if let Some(target) = target {
                 let mut data = [self.source, target.version << 24, NONE, NONE, NONE];
@@ -238,6 +251,7 @@ impl DragSource {
         if self.release.is_some() {
             return Ok(None);
         }
+        debug!(source = self.source, hover = ?self.hover, "XDND source released");
         self.release = Some(time);
         self.release_pointer();
         self.deadline = Some(Instant::now() + REPLY_TIMEOUT);
@@ -271,6 +285,7 @@ impl DragSource {
         }
         hover.waiting = false;
         let accepted = flags & 1 != 0 && action == self.xconn.atoms()[XdndActionCopy];
+        trace!(source = self.source, target, accepted, flags, action, "XDND source status");
         if std::mem::replace(&mut hover.accepted, accepted) != accepted {
             self.update_cursor(accepted);
         }
@@ -287,6 +302,13 @@ impl DragSource {
     }
 
     pub(crate) fn finish(mut self, success: bool) -> (WindowId, WindowEvent) {
+        debug!(
+            source = self.source,
+            released = self.release.is_some(),
+            sent_drop = self.dropped,
+            success,
+            "XDND source finished"
+        );
         if !success && !self.dropped {
             self.leave();
         }
@@ -304,7 +326,10 @@ impl DragSource {
         let requestor = request.requestor as _;
         let target = request.target as _;
         let property = if request.property == 0 { target } else { request.property as _ };
-        let result = if request.owner == self.source as _ && self.dropped {
+        // XWayland compositors may discover the offered formats as soon as
+        // the drag claims XdndSelection. Reading the payload still needs a drop.
+        let metadata = target == self.xconn.atoms()[TARGETS];
+        let result = if request.owner == self.source as _ && (metadata || self.dropped) {
             self.write_selection(requestor, target, property)
         } else {
             Ok(false)
@@ -456,11 +481,11 @@ fn advertised_types(xconn: &XConnection, data: &dyn DataTransferSend) -> Vec<xpr
 fn target_at(
     xconn: &XConnection,
     root: xproto::Window,
+    frame: xproto::Window,
     position: Position,
     borderless_source: Option<xproto::Window>,
 ) -> Option<Target> {
     let conn = xconn.xcb_connection();
-    let frame = child_at(xconn, root, root, position)?;
     if let Some(target) = target_in_frame(xconn, root, frame, position) {
         return Some(target);
     }
