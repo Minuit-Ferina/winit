@@ -104,10 +104,25 @@ impl DragSource {
     ) -> Result<Self, X11Error> {
         let atoms = xconn.atoms();
         let conn = xconn.xcb_connection();
-        let pointer = xconn.query_pointer(root, device)?;
+        let pointer = xconn.query_pointer(source, device)?;
         if !pointer.same_screen || !pointer.buttons.first().is_some_and(|buttons| buttons & 2 != 0)
         {
             return Err(X11Error::UnexpectedNull("active primary button drag"));
+        }
+
+        // XWayland can synthesize button-up on re-entry if the compositor
+        // changes pointer focus before it sees us claim XdndSelection. Start
+        // with the pointer inside the source so that the compositor can keep
+        // the original surface as the drag origin.
+        if xconn.is_xwayland() {
+            let geometry = conn.get_geometry(source)?.reply()?;
+            let x = pointer.win_x >> 16;
+            let y = pointer.win_y >> 16;
+            if !(0..i32::from(geometry.width)).contains(&x)
+                || !(0..i32::from(geometry.height)).contains(&y)
+            {
+                return Err(X11Error::UnexpectedNull("pointer inside the XWayland drag source"));
+            }
         }
 
         let types = advertised_types(&xconn, &*data);
