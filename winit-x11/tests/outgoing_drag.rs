@@ -11,6 +11,9 @@ use winit_core::data_transfer::{DataTransferId, DataTransferSendBuilder, TypeHin
 use winit_core::event::{ButtonSource, ElementState, MouseButton, WindowEvent};
 use winit_core::event_loop::{ActiveEventLoop, ControlFlow, DndAction};
 use winit_core::window::{Window, WindowAttributes, WindowId};
+use x11rb::connection::Connection as _;
+use x11rb::protocol::Event;
+use x11rb::protocol::xproto::{self, ConnectionExt as _};
 
 const PAYLOAD: &str = "winit XDND source";
 
@@ -181,7 +184,11 @@ impl ApplicationHandler for DragTest {
             if scenario == Scenario::Escape {
                 input.args(["key", "Escape", "sleep", "0.05"]);
             }
-            assert!(input.args(["mouseup", "1"]).status().unwrap().success());
+            assert!(input.status().unwrap().success());
+            if scenario == Scenario::CopyAcrossGap {
+                check_selection_during_hover();
+            }
+            assert!(Command::new("xdotool").args(["mouseup", "1"]).status().unwrap().success());
         }));
     }
 
@@ -252,6 +259,59 @@ impl ApplicationHandler for DragTest {
             event_loop.exit();
         } else {
             event_loop.set_control_flow(ControlFlow::WaitUntil(self.deadline));
+        }
+    }
+}
+
+fn check_selection_during_hover() {
+    let (conn, screen) = x11rb::connect(None).unwrap();
+    let root = conn.setup().roots[screen].root;
+    let window = conn.generate_id().unwrap();
+    conn.create_window(
+        x11rb::COPY_DEPTH_FROM_PARENT,
+        window,
+        root,
+        0,
+        0,
+        1,
+        1,
+        0,
+        xproto::WindowClass::INPUT_OUTPUT,
+        x11rb::COPY_FROM_PARENT,
+        &xproto::CreateWindowAux::new(),
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+
+    let atom = |name| conn.intern_atom(false, name).unwrap().reply().unwrap().atom;
+    let selection = atom(b"XdndSelection");
+    let targets = atom(b"TARGETS");
+    let text = atom(b"UTF8_STRING");
+    let property = atom(b"WINIT_TEST_SELECTION");
+    for (target, expected_property) in [(targets, property), (text, x11rb::NONE)] {
+        conn.convert_selection(window, selection, target, property, x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        conn.flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(Event::SelectionNotify(reply)) = conn.poll_for_event().unwrap() {
+                assert_eq!(reply.target, target);
+                assert_eq!(reply.property, expected_property);
+                break;
+            }
+            assert!(Instant::now() < deadline, "missing XdndSelection reply");
+            thread::sleep(Duration::from_millis(5));
+        }
+        if target == targets {
+            let reply = conn
+                .get_property(true, window, property, xproto::AtomEnum::ATOM, 0, 100)
+                .unwrap()
+                .reply()
+                .unwrap();
+            assert!(reply.value32().unwrap().any(|format| format == text));
         }
     }
 }
