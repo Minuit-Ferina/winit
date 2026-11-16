@@ -30,7 +30,7 @@ use crate::{XWindow, util};
 const INCR_CHUNK_SIZE_BYTES: usize = 1024;
 
 /// TODO: this is copied from wayland. Is this the right approach for X11 as well?
-fn encode_uri_list<I>(uri_list: I) -> Vec<u8>
+pub(crate) fn encode_uri_list<I>(uri_list: I) -> Vec<u8>
 where
     I: IntoIterator,
     I::Item: AsRef<OsStr>,
@@ -129,7 +129,7 @@ pub struct DragState {
 }
 
 /// Create a new [`DataTransferId`] from a global counter
-fn generate_transfer_id() -> DataTransferId {
+pub(crate) fn generate_transfer_id() -> DataTransferId {
     static DATA_TRANSFER_ID: AtomicI64 = AtomicI64::new(0);
     DataTransferId::from_raw(DATA_TRANSFER_ID.fetch_add(1, Ordering::Relaxed))
 }
@@ -392,7 +392,7 @@ impl SelectionType {
         Self { hint, atom }
     }
 
-    fn from_dyn(atoms: &Atoms, type_: &dyn TransferType) -> impl Iterator<Item = Self> {
+    pub(crate) fn from_dyn(atoms: &Atoms, type_: &dyn TransferType) -> impl Iterator<Item = Self> {
         let downcast = type_.cast_ref::<Self>().cloned();
         let downcast_failed = downcast.is_none();
         // This filter is a bit hacky, but it's the only way to ensure that we always

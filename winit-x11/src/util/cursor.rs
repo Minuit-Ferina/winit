@@ -18,16 +18,18 @@ impl XConnection {
         window: xproto::Window,
         cursor: Option<CursorIcon>,
     ) -> Result<(), X11Error> {
-        let cursor = {
-            let mut cache = self.cursor_cache.lock().unwrap_or_else(|e| e.into_inner());
+        self.update_cursor(window, self.cached_cursor(cursor)?)
+    }
 
-            match cache.entry(cursor) {
-                Entry::Occupied(o) => *o.get(),
-                Entry::Vacant(v) => *v.insert(self.get_cursor(cursor)?),
-            }
-        };
-
-        self.update_cursor(window, cursor)
+    pub(crate) fn cached_cursor(
+        &self,
+        cursor: Option<CursorIcon>,
+    ) -> Result<xproto::Cursor, X11Error> {
+        let mut cache = self.cursor_cache.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(match cache.entry(cursor) {
+            Entry::Occupied(o) => *o.get(),
+            Entry::Vacant(v) => *v.insert(self.get_cursor(cursor)?),
+        })
     }
 
     pub(crate) fn set_custom_cursor(

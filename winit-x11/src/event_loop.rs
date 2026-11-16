@@ -28,8 +28,8 @@ use winit_core::event_loop::primary_selection::PrimarySelectionExt;
 use winit_core::event_loop::pump_events::PumpStatus;
 use winit_core::event_loop::{
     ActiveEventLoop as RootActiveEventLoop, AsyncRequestSerial, ControlFlow, DeviceEvents,
-    DndAction, EventLoopProvider, EventLoopProxy as CoreEventLoopProxy, EventLoopProxyProvider,
-    OwnedDisplayHandle as CoreOwnedDisplayHandle,
+    DndAction, DragIcon, EventLoopProvider, EventLoopProxy as CoreEventLoopProxy,
+    EventLoopProxyProvider, OwnedDisplayHandle as CoreOwnedDisplayHandle,
 };
 use winit_core::monitor::MonitorHandle as CoreMonitorHandle;
 use winit_core::window::{Theme, Window as CoreWindow, WindowAttributes, WindowId};
@@ -45,6 +45,7 @@ use crate::atoms::{
     WM_DELETE_WINDOW,
 };
 use crate::data_transfer::{ClipboardSelectionType, DataTransferState};
+use crate::drag_source::DragSource;
 use crate::event_processor::{EventProcessor, MAX_MOD_REPLAY_LEN};
 use crate::ime::{self, Ime, ImeCreationError, ImeSender};
 use crate::util::{self, CustomCursor};
@@ -176,6 +177,8 @@ impl<T> PeekableReceiver<T> {
 pub struct ActiveEventLoop {
     pub(crate) xconn: Arc<XConnection>,
     pub(crate) data_transfer_state: RefCell<DataTransferState>,
+    pub(crate) outgoing_drag: RefCell<Option<DragSource>>,
+    pub(crate) drag_pointer: Cell<Option<(WindowId, xinput::DeviceId)>>,
     pub(crate) wm_delete_window: xproto::Atom,
     pub(crate) net_wm_ping: xproto::Atom,
     pub(crate) net_wm_sync_request: xproto::Atom,
@@ -372,6 +375,8 @@ impl EventLoop {
         let window_target = ActiveEventLoop {
             ime,
             data_transfer_state,
+            outgoing_drag: RefCell::new(None),
+            drag_pointer: Cell::new(None),
             root,
             control_flow: Cell::new(ControlFlow::default()),
             exit: Cell::new(None),
@@ -542,7 +547,15 @@ impl EventLoop {
                 },
             };
 
-            min_timeout(control_flow_timeout, timeout)
+            let drag_timeout = self
+                .event_processor
+                .target
+                .outgoing_drag
+                .borrow()
+                .as_ref()
+                .and_then(DragSource::deadline)
+                .map(|deadline| deadline.saturating_duration_since(start));
+            min_timeout(min_timeout(control_flow_timeout, timeout), drag_timeout)
         };
 
         self.state.x11_readiness = Readiness::EMPTY;
@@ -598,6 +611,7 @@ impl EventLoop {
 
         // Process all pending events
         self.drain_events(app);
+        self.event_processor.expire_outgoing_drag(app);
 
         // Empty activation tokens.
         while let Ok((window_id, serial)) = self.activation_receiver.try_recv() {
@@ -925,9 +939,38 @@ impl RootActiveEventLoop for ActiveEventLoop {
             return Err(TransferError::UnknownTransfer(id));
         }
 
-        state.accepted = !actions.is_empty();
+        state.accepted = actions.contains(&DndAction::Copy);
 
         Ok(())
+    }
+
+    fn start_drag(
+        &self,
+        source: WindowId,
+        data: Box<dyn DataTransferSend>,
+        actions: &[DndAction],
+        _icon: Option<DragIcon>,
+    ) -> Result<DataTransferId, TransferError> {
+        if !actions.contains(&DndAction::Copy) {
+            return Err(NotSupportedError::new("X11 drag sources only support copying").into());
+        }
+        if self.windows.borrow().get(&source).and_then(Weak::upgrade).is_none() {
+            return Err(TransferError::Failed);
+        }
+        let mut outgoing = self.outgoing_drag.borrow_mut();
+        if outgoing.is_some() {
+            return Err(TransferError::Failed);
+        }
+        let Some((_, device)) = self.drag_pointer.get().filter(|&(window, _)| window == source)
+        else {
+            return Err(TransferError::Failed);
+        };
+        let drag =
+            DragSource::start(self.xconn.clone(), source.into_raw() as _, self.root, device, data)
+                .map_err(|err| TransferError::Os(os_error!(err)))?;
+        let id = drag.id();
+        *outgoing = Some(drag);
+        Ok(id)
     }
 
     fn clipboard(&self) -> Result<Option<DataTransferId>, TransferError> {

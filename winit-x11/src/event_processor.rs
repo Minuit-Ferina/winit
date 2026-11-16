@@ -37,9 +37,10 @@ use xkbcommon_dl::xkb_mod_mask_t;
 
 use crate::atoms::*;
 use crate::data_transfer::{ClipboardSelectionType, DndState, SelectionType};
+use crate::drag_source::DragSource;
 use crate::event_loop::{
     ALL_DEVICES, ActiveEventLoop, CookieResultExt, Device, DeviceInfo, DeviceType,
-    ScrollOrientation, mkdid, mkwid,
+    ScrollOrientation, X11Error, mkdid, mkwid,
 };
 use crate::ime::{ImeEvent, ImeEventReceiver, ImeReceiver, ImeRequest};
 use crate::util;
@@ -149,6 +150,9 @@ impl EventProcessor {
 
     fn process_xevent(&mut self, xev: &mut XEvent, app: &mut dyn ApplicationHandler) {
         let event_type = xev.get_type();
+        if self.outgoing_drag_input(xev, app) {
+            return;
+        }
 
         // If we have IME disabled, don't try to `filter_event`, since only IME can consume them
         // and forward back. This is not desired for e.g. games since some IMEs may delay the input
@@ -188,7 +192,16 @@ impl EventProcessor {
             xlib::ClientMessage => self.client_message(xev.as_ref(), app),
             xlib::SelectionRequest => self.selection_request(xev.as_ref()),
             xlib::SelectionNotify => self.selection_notify(xev.as_ref(), app),
-            xlib::SelectionClear => self.selection_clear(xev.as_ref()),
+            xlib::SelectionClear => {
+                let event: &XSelectionEvent = xev.as_ref();
+                if event.selection as xproto::Atom == self.target.xconn.atoms()[XdndSelection] {
+                    self.update_outgoing_drag(app, |drag| {
+                        Ok((drag.source() == event.requestor as _).then_some(false))
+                    });
+                } else {
+                    self.selection_clear(event);
+                }
+            },
             xlib::ConfigureNotify => self.configure_notify(xev.as_ref(), app),
             xlib::ReparentNotify => self.reparent_notify(xev.as_ref()),
             xlib::MapNotify => self.map_notify(xev.as_ref(), app),
@@ -224,13 +237,34 @@ impl EventProcessor {
                         };
 
                         let xev: &XIDeviceEvent = unsafe { xev.as_event() };
+                        if xev.detail == 1 {
+                            if state == ElementState::Pressed {
+                                self.target
+                                    .drag_pointer
+                                    .set(Some((mkwid(xev.event as _), xev.deviceid as _)));
+                            } else {
+                                if self
+                                    .target
+                                    .drag_pointer
+                                    .get()
+                                    .is_some_and(|(_, device)| i32::from(device) == xev.deviceid)
+                                {
+                                    self.target.drag_pointer.set(None);
+                                }
+                                if self.outgoing_drag_pointer(xev, true, app) {
+                                    return;
+                                }
+                            }
+                        }
                         self.update_mods_from_xinput2_event(&xev.mods, &xev.group, false, app);
                         self.xinput2_button_input(xev, state, app);
                     },
                     xinput2::XI_Motion => {
                         let xev: &XIDeviceEvent = unsafe { xev.as_event() };
                         self.update_mods_from_xinput2_event(&xev.mods, &xev.group, false, app);
-                        self.xinput2_mouse_motion(xev, app);
+                        if !self.outgoing_drag_pointer(xev, false, app) {
+                            self.xinput2_mouse_motion(xev, app);
+                        }
                     },
                     xinput2::XI_Enter => {
                         let xev: &XIEnterEvent = unsafe { xev.as_event() };
@@ -300,6 +334,81 @@ impl EventProcessor {
                 }
             },
         }
+    }
+
+    fn outgoing_drag_input(&mut self, xev: &mut XEvent, app: &mut dyn ApplicationHandler) -> bool {
+        if self.target.outgoing_drag.borrow().is_none() {
+            return false;
+        }
+        match xev.get_type() {
+            xlib::KeyPress => {
+                let event: &mut XKeyEvent = xev.as_mut();
+                // SAFETY: this is a live KeyPress event from the Xlib queue.
+                let key = unsafe { (self.target.xconn.xlib.XLookupKeysym)(event, 0) };
+                if key != x11_dl::keysym::XK_Escape as _ {
+                    return false;
+                }
+                self.update_outgoing_drag(app, |_| Ok(Some(false)));
+                true
+            },
+            _ => false,
+        }
+    }
+
+    fn outgoing_drag_pointer(
+        &self,
+        event: &XIDeviceEvent,
+        released: bool,
+        app: &mut dyn ApplicationHandler,
+    ) -> bool {
+        if !self
+            .target
+            .outgoing_drag
+            .borrow()
+            .as_ref()
+            .is_some_and(|drag| drag.device_matches(event.deviceid))
+        {
+            return false;
+        }
+        self.update_outgoing_drag(app, |drag| {
+            drag.motion(event.root_x as i16, event.root_y as i16, event.time as _)?;
+            if released { drag.release(event.time as _) } else { Ok(None) }
+        });
+        true
+    }
+
+    fn update_outgoing_drag(
+        &self,
+        app: &mut dyn ApplicationHandler,
+        update: impl FnOnce(&mut DragSource) -> Result<Option<bool>, X11Error>,
+    ) {
+        let event = {
+            let mut outgoing = self.target.outgoing_drag.borrow_mut();
+            let Some(drag) = outgoing.as_mut() else { return };
+            let outcome = match update(drag) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    debug!("XDND source failed: {err}");
+                    Some(false)
+                },
+            };
+            outcome.and_then(|success| outgoing.take().map(|drag| drag.finish(success)))
+        };
+        if let Some((window, event)) = event {
+            if self.target.drag_pointer.get().is_some_and(|(source, _)| source == window) {
+                self.target.drag_pointer.set(None);
+            }
+            app.window_event(&self.target, window, event);
+        }
+    }
+
+    pub(crate) fn expire_outgoing_drag(&self, app: &mut dyn ApplicationHandler) {
+        self.update_outgoing_drag(app, |drag| {
+            Ok(drag
+                .deadline()
+                .is_some_and(|deadline| deadline <= std::time::Instant::now())
+                .then_some(false))
+        });
     }
 
     pub fn poll(&self) -> bool {
@@ -378,6 +487,25 @@ impl EventProcessor {
 
         let window = xev.window as xproto::Window;
         let window_id = mkwid(window);
+
+        let kind = xev.message_type as xproto::Atom;
+        if kind == atoms[XdndStatus] || kind == atoms[XdndFinished] {
+            if xev.format == 32 {
+                let target = xev.data.get_long(0) as u32;
+                let flags = xev.data.get_long(1) as u32;
+                self.update_outgoing_drag(app, |drag| {
+                    if drag.source() != window {
+                        return Ok(None);
+                    }
+                    if kind == atoms[XdndStatus] {
+                        drag.status(target, flags, xev.data.get_long(4) as u32)
+                    } else {
+                        Ok(drag.finished(target, flags, xev.data.get_long(2) as u32))
+                    }
+                });
+            }
+            return;
+        }
 
         if xev.data.get_long(0) as xproto::Atom == self.target.wm_delete_window {
             app.window_event(&self.target, window_id, WindowEvent::CloseRequested);
@@ -521,15 +649,9 @@ impl EventProcessor {
                 // Log this timestamp.
                 self.target.xconn.set_timestamp(time);
 
-                unsafe {
-                    dnd.send_status(
-                        window,
-                        source_window,
-                        if state.accepted { DndState::Accepted } else { DndState::Rejected },
-                    )
-                    .expect("Failed to send `XdndStatus` message.");
+                if state.source_window != source_window || state.target_window != window {
+                    return;
                 }
-
                 state.transfer_id
             };
 
@@ -544,6 +666,15 @@ impl EventProcessor {
                 proposed_action: Some(DndAction::Copy),
             });
 
+            // The application can choose whether to accept this position in its callback.
+            let dnd = self.target.data_transfer_state.borrow();
+            if let Some(state) = dnd.state().filter(|state| state.transfer_id == transfer_id) {
+                let status = if state.accepted { DndState::Accepted } else { DndState::Rejected };
+                // SAFETY: window IDs come from the current XDND session.
+                if let Err(err) = unsafe { dnd.send_status(window, source_window, status) } {
+                    debug!("Failed to send XDND status: {err}");
+                }
+            }
             return;
         }
 
@@ -605,6 +736,12 @@ impl EventProcessor {
     /// Handles the X11 `SelectionRequest` which occurs when we own a selection and another
     /// application wants to read it
     fn selection_request(&mut self, xev: &XSelectionRequestEvent) {
+        if xev.selection as xproto::Atom == self.target.xconn.atoms()[XdndSelection] {
+            if let Some(drag) = self.target.outgoing_drag.borrow().as_ref() {
+                drag.selection_request(xev);
+            }
+            return;
+        }
         let mut data_transfer = self.target.data_transfer_state.borrow_mut();
         if !data_transfer.attach_clipboard_property(xev) {
             info!("Not sending selection notify, no resolved value");
@@ -1042,6 +1179,7 @@ impl EventProcessor {
     fn destroy_notify(&self, xev: &XDestroyWindowEvent, app: &mut dyn ApplicationHandler) {
         let window = xev.window as xproto::Window;
         let window_id = mkwid(window);
+        self.update_outgoing_drag(app, |drag| Ok(drag.window_destroyed(window).then_some(false)));
 
         // In the event that the window's been destroyed without being dropped first, we
         // cleanup again here.
