@@ -376,6 +376,22 @@ impl DragSource {
         }
     }
 
+    // Both windows can belong to this process. The destination may change
+    // its decision after XdndStatus (for example after an application frame)
+    // without the pointer moving again.
+    pub(crate) fn update_local_feedback(
+        &self,
+        source: xproto::Window,
+        target: xproto::Window,
+        accepted: bool,
+    ) {
+        if self.source == source
+            && self.hover.as_ref().is_some_and(|hover| hover.target.window == target)
+        {
+            self.update_cursor(accepted);
+        }
+    }
+
     fn update_cursor(&self, accepted: bool) {
         if self.pointer_grabbed {
             let icon = if accepted { CursorIcon::Copy } else { CursorIcon::NoDrop };

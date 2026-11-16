@@ -134,8 +134,11 @@ impl ApplicationHandler for DragTest {
             } if source => {
                 self.pointer_down = true;
             },
-            WindowEvent::PointerMoved { .. }
-                if source && self.pointer_down && self.transfer.is_none() =>
+            WindowEvent::PointerMoved { position, .. }
+                if source
+                    && self.pointer_down
+                    && self.transfer.is_none()
+                    && position.x >= 180.0 =>
             {
                 let data = DataTransferSendBuilder::new(PAYLOAD)
                     .with_type(TypeHint::Plaintext, |value, _| Some(value.to_string()))

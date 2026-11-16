@@ -939,7 +939,13 @@ impl RootActiveEventLoop for ActiveEventLoop {
             return Err(TransferError::UnknownTransfer(id));
         }
 
-        state.accepted = actions.contains(&DndAction::Copy);
+        let accepted = actions.contains(&DndAction::Copy);
+        if state.accepted != accepted {
+            state.accepted = accepted;
+            if let Some(drag) = self.outgoing_drag.borrow().as_ref() {
+                drag.update_local_feedback(state.source_window, state.target_window, accepted);
+            }
+        }
 
         Ok(())
     }
