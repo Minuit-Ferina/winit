@@ -10,6 +10,7 @@ use winit_core::event_loop::DndAction;
 use winit_core::window::WindowId;
 use x11_dl::xlib::XSelectionRequestEvent;
 use x11rb::connection::{Connection, RequestConnection};
+use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt as _, EventMask};
 use x11rb::{CURRENT_TIME, NONE};
@@ -83,6 +84,7 @@ pub(crate) struct DragSource {
     types: Vec<xproto::Atom>,
     root: xproto::Window,
     device: xinput::DeviceId,
+    source_borderless: bool,
     hover: Option<Hover>,
     pointer_grabbed: bool,
     owns_selection: bool,
@@ -97,6 +99,7 @@ impl DragSource {
         source: xproto::Window,
         root: xproto::Window,
         device: xinput::DeviceId,
+        source_borderless: bool,
         data: Box<dyn DataTransferSend>,
     ) -> Result<Self, X11Error> {
         let atoms = xconn.atoms();
@@ -127,6 +130,7 @@ impl DragSource {
             types,
             root,
             device,
+            source_borderless,
             hover: None,
             pointer_grabbed: true,
             owns_selection: false,
@@ -186,7 +190,12 @@ impl DragSource {
             return Ok(());
         }
         let position = Position { x, y, time };
-        let target = target_at(&self.xconn, self.root, position);
+        let target = target_at(
+            &self.xconn,
+            self.root,
+            position,
+            self.source_borderless.then_some(self.source),
+        );
 
         if self.hover.as_ref().map(|hover| hover.target) != target {
             self.leave();
@@ -444,7 +453,41 @@ fn advertised_types(xconn: &XConnection, data: &dyn DataTransferSend) -> Vec<xpr
     types
 }
 
-fn target_at(xconn: &XConnection, root: xproto::Window, position: Position) -> Option<Target> {
+fn target_at(
+    xconn: &XConnection,
+    root: xproto::Window,
+    position: Position,
+    borderless_source: Option<xproto::Window>,
+) -> Option<Target> {
+    let conn = xconn.xcb_connection();
+    let frame = child_at(xconn, root, root, position)?;
+    if let Some(target) = target_in_frame(xconn, root, frame, position) {
+        return Some(target);
+    }
+
+    // A window manager can wrap even a borderless client in a frame whose
+    // shadow covers its neighbors. Only look behind the source's own wrapper,
+    // and stop at the first lower window that actually covers the pointer.
+    let source = borderless_source?;
+    if conn.query_tree(frame).ok()?.reply().ok()?.children.as_slice() != [source] {
+        return None;
+    }
+    let children = conn.query_tree(root).ok()?.reply().ok()?.children;
+    let covered = children
+        .into_iter()
+        .rev()
+        .skip_while(|&window| window != frame)
+        .skip(1)
+        .find(|&window| window_contains_point(xconn, window, position))?;
+    target_in_frame(xconn, root, covered, position)
+}
+
+fn target_in_frame(
+    xconn: &XConnection,
+    root: xproto::Window,
+    mut window: xproto::Window,
+    position: Position,
+) -> Option<Target> {
     let conn = xconn.xcb_connection();
     let atoms = xconn.atoms();
     let property = |window, name, ty: xproto::AtomEnum| {
@@ -456,16 +499,7 @@ fn target_at(xconn: &XConnection, root: xproto::Window, position: Position) -> O
             .next()
     };
 
-    // WM frames can contain the actual client window. Walk the windows under the pointer until
-    // we reach the nearest XDND-aware client.
-    let mut window = root;
     for _ in 0..64 {
-        let reply =
-            conn.translate_coordinates(root, window, position.x, position.y).ok()?.reply().ok()?;
-        window = reply.child;
-        if window == NONE || !reply.same_screen {
-            break;
-        }
         let proxy = property(window, XdndProxy, xproto::AtomEnum::WINDOW)
             .filter(|&proxy| property(proxy, XdndProxy, xproto::AtomEnum::WINDOW) == Some(proxy));
         let recipient = proxy.unwrap_or(window);
@@ -474,6 +508,59 @@ fn target_at(xconn: &XConnection, root: xproto::Window, position: Position) -> O
         {
             return Some(Target { window, recipient, version: version.min(VERSION) });
         }
+        window = child_at(xconn, root, window, position)?;
     }
     None
+}
+
+fn child_at(
+    xconn: &XConnection,
+    root: xproto::Window,
+    parent: xproto::Window,
+    position: Position,
+) -> Option<xproto::Window> {
+    let reply = xconn
+        .xcb_connection()
+        .translate_coordinates(root, parent, position.x, position.y)
+        .ok()?
+        .reply()
+        .ok()?;
+    (reply.same_screen && reply.child != NONE).then_some(reply.child)
+}
+
+fn window_contains_point(xconn: &XConnection, window: xproto::Window, position: Position) -> bool {
+    let conn = xconn.xcb_connection();
+    let Some(geometry) = conn.get_geometry(window).ok().and_then(|cookie| cookie.reply().ok())
+    else {
+        return false;
+    };
+    let border = i32::from(geometry.border_width);
+    let x = i32::from(position.x) - i32::from(geometry.x) - border;
+    let y = i32::from(position.y) - i32::from(geometry.y) - border;
+    if !(-border..i32::from(geometry.width) + border).contains(&x)
+        || !(-border..i32::from(geometry.height) + border).contains(&y)
+        || !conn
+            .get_window_attributes(window)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .is_some_and(|attrs| attrs.map_state == xproto::MapState::VIEWABLE)
+    {
+        return false;
+    }
+    if conn.extension_information(shape::X11_EXTENSION_NAME).ok().flatten().is_none() {
+        return true;
+    }
+    [shape::SK::BOUNDING, shape::SK::INPUT].into_iter().all(|kind| {
+        conn.shape_get_rectangles(window, kind)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .is_some_and(|reply| {
+                reply.rectangles.iter().any(|rect| {
+                    let left = i32::from(rect.x);
+                    let top = i32::from(rect.y);
+                    (left..left + i32::from(rect.width)).contains(&x)
+                        && (top..top + i32::from(rect.height)).contains(&y)
+                })
+            })
+    })
 }
