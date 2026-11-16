@@ -321,6 +321,12 @@ pub trait ActiveEventLoop: Any + fmt::Debug {
     /// operation. For those platforms, consider using the platform-specific implementation of
     /// [`DataTransferSend`] for `send_data` and set this field to `None`.
     ///
+    /// ### Platform-specific
+    ///
+    /// - **X11:** Start while the primary mouse button is held on the source window. Supports
+    ///   copying and the system drop cursor. Custom drag images are ignored and data must fit
+    ///   within a single X11 property request.
+    ///
     /// ### Returns
     ///
     /// A unique identifier for this drag operation, which will be later supplied by

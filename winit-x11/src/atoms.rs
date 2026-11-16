@@ -96,6 +96,7 @@ atom_manager! {
     XdndSelection,
     XdndFinished,
     XdndTypeList,
+    XdndProxy,
 
     // MIME types for reading selections
     TextUriList: b"text/uri-list",

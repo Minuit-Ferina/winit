@@ -21,6 +21,7 @@ macro_rules! os_error {
 mod activation;
 mod atoms;
 mod data_transfer;
+mod drag_source;
 mod event_loop;
 mod event_processor;
 pub mod ffi;
