@@ -18,7 +18,14 @@ const PAYLOAD: &str = "winit XDND source";
 #[ignore = "requires a disposable X11 display and xdotool"]
 fn completes_and_cancels_drags_between_x11_windows() {
     let mut events = winit_x11::EventLoop::new().unwrap();
-    for scenario in [Scenario::Copy, Scenario::Reject, Scenario::Escape, Scenario::Copy] {
+    for scenario in [
+        Scenario::Copy,
+        Scenario::CopyAcrossGap,
+        Scenario::CopyAcrossOverlap,
+        Scenario::Reject,
+        Scenario::Escape,
+        Scenario::Copy,
+    ] {
         let mut app = DragTest {
             scenario,
             source: None,
@@ -34,7 +41,7 @@ fn completes_and_cancels_drags_between_x11_windows() {
         events.run_app_on_demand(&mut app).unwrap();
         app.driver.take().unwrap().join().unwrap();
         assert!(app.visited_destination, "{scenario:?}");
-        let copied = scenario == Scenario::Copy;
+        let copied = scenario.copies();
         assert_eq!(app.received.as_deref(), copied.then_some(PAYLOAD), "{scenario:?}");
         assert_eq!(app.outcome, Some(copied), "{scenario:?}");
     }
@@ -43,8 +50,24 @@ fn completes_and_cancels_drags_between_x11_windows() {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Scenario {
     Copy,
+    CopyAcrossGap,
+    CopyAcrossOverlap,
     Reject,
     Escape,
+}
+
+impl Scenario {
+    fn copies(self) -> bool {
+        matches!(self, Self::Copy | Self::CopyAcrossGap | Self::CopyAcrossOverlap)
+    }
+
+    fn target_x(self) -> i32 {
+        match self {
+            Self::CopyAcrossGap => 214,
+            Self::CopyAcrossOverlap => 180,
+            _ => 330,
+        }
+    }
 }
 
 struct DragTest {
@@ -65,30 +88,57 @@ impl ApplicationHandler for DragTest {
         let attributes = WindowAttributes::default()
             .with_decorations(false)
             .with_surface_size(PhysicalSize::new(180, 180));
-        let source = event_loop
+        let destination = event_loop
             .create_window(
                 attributes
                     .clone()
+                    .with_title("winit-x11-target")
+                    .with_position(PhysicalPosition::new(self.scenario.target_x(), 30)),
+            )
+            .unwrap();
+        let source = event_loop
+            .create_window(
+                attributes
                     .with_title("winit-x11-source")
                     .with_position(PhysicalPosition::new(30, 30)),
             )
             .unwrap();
-        let destination = event_loop
-            .create_window(
-                attributes
-                    .with_title("winit-x11-target")
-                    .with_position(PhysicalPosition::new(330, 30)),
-            )
-            .unwrap();
         let source_xid = source.id().into_raw().to_string();
+        let destination_xid = destination.id().into_raw().to_string();
         self.source = Some(source);
         self.destination = Some(destination);
 
         let scenario = self.scenario;
         self.driver = Some(thread::spawn(move || {
-            thread::sleep(Duration::from_millis(100));
+            let windows_visible = (0..80).any(|_| {
+                if Command::new("xdotool")
+                    .args(["search", "--onlyvisible", "--name", "^winit-x11-(source|target)$"])
+                    .output()
+                    .is_ok_and(|output| {
+                        String::from_utf8_lossy(&output.stdout).lines().count() == 2
+                    })
+                {
+                    return true;
+                }
+                thread::sleep(Duration::from_millis(25));
+                false
+            });
+            assert!(windows_visible, "both test windows should be visible");
             let mut input = Command::new("xdotool");
+            let target_x = scenario.target_x().to_string();
             input.args([
+                "windowmove",
+                &destination_xid,
+                &target_x,
+                "30",
+                "windowmove",
+                &source_xid,
+                "30",
+                "30",
+                "sleep",
+                "0.15",
+                "windowraise",
+                &source_xid,
                 "windowfocus",
                 &source_xid,
                 "mousemove",
@@ -104,11 +154,30 @@ impl ApplicationHandler for DragTest {
                 "sleep",
                 "0.1",
                 "mousemove",
-                "400",
+                if matches!(scenario, Scenario::CopyAcrossGap | Scenario::CopyAcrossOverlap) {
+                    "222"
+                } else {
+                    "400"
+                },
                 "90",
                 "sleep",
                 "0.2",
             ]);
+            if matches!(scenario, Scenario::CopyAcrossGap | Scenario::CopyAcrossOverlap) {
+                // Revisit the source briefly, then cross straight back into the target.
+                input.args([
+                    "mousemove",
+                    "206",
+                    "90",
+                    "sleep",
+                    "0.03",
+                    "mousemove",
+                    "222",
+                    "90",
+                    "sleep",
+                    "0.1",
+                ]);
+            }
             if scenario == Scenario::Escape {
                 input.args(["key", "Escape", "sleep", "0.05"]);
             }
@@ -156,7 +225,7 @@ impl ApplicationHandler for DragTest {
                 event_loop.set_valid_dnd_actions(id, actions).unwrap();
             },
             WindowEvent::DragDropped { id, .. } if destination => {
-                assert_eq!(self.scenario, Scenario::Copy);
+                assert!(self.scenario.copies());
                 event_loop.fetch_data_transfer(id, &TypeHint::Plaintext).unwrap();
             },
             WindowEvent::DataTransferReceived { value, .. } if destination => {

@@ -960,9 +960,9 @@ impl RootActiveEventLoop for ActiveEventLoop {
         if !actions.contains(&DndAction::Copy) {
             return Err(NotSupportedError::new("X11 drag sources only support copying").into());
         }
-        if self.windows.borrow().get(&source).and_then(Weak::upgrade).is_none() {
+        let Some(window) = self.windows.borrow().get(&source).and_then(Weak::upgrade) else {
             return Err(TransferError::Failed);
-        }
+        };
         let mut outgoing = self.outgoing_drag.borrow_mut();
         if outgoing.is_some() {
             return Err(TransferError::Failed);
@@ -971,9 +971,15 @@ impl RootActiveEventLoop for ActiveEventLoop {
         else {
             return Err(TransferError::Failed);
         };
-        let drag =
-            DragSource::start(self.xconn.clone(), source.into_raw() as _, self.root, device, data)
-                .map_err(|err| TransferError::Os(os_error!(err)))?;
+        let drag = DragSource::start(
+            self.xconn.clone(),
+            source.into_raw() as _,
+            self.root,
+            device,
+            !window.is_decorated(),
+            data,
+        )
+        .map_err(|err| TransferError::Os(os_error!(err)))?;
         let id = drag.id();
         *outgoing = Some(drag);
         Ok(id)
