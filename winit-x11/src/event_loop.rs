@@ -957,6 +957,41 @@ impl RootActiveEventLoop for ActiveEventLoop {
         actions: &[DndAction],
         _icon: Option<DragIcon>,
     ) -> Result<DataTransferId, TransferError> {
+        self.start_drag_impl(source, data, actions, _icon, false)
+    }
+
+    fn start_internal_drag(
+        &self,
+        source: WindowId,
+        data: Box<dyn DataTransferSend>,
+        actions: &[DndAction],
+        _icon: Option<DragIcon>,
+    ) -> Result<DataTransferId, TransferError> {
+        self.start_drag_impl(source, data, actions, _icon, true)
+    }
+
+    fn clipboard(&self) -> Result<Option<DataTransferId>, TransferError> {
+        self.read_clipboard(ClipboardSelectionType::Clipboard)
+    }
+
+    fn set_clipboard(&self, send_data: Box<dyn DataTransferSend>) -> Result<(), TransferError> {
+        self.write_clipboard(ClipboardSelectionType::Clipboard, send_data)
+    }
+
+    fn primary_selection_ext(&self) -> Option<&dyn PrimarySelectionExt> {
+        Some(self)
+    }
+}
+
+impl ActiveEventLoop {
+    fn start_drag_impl(
+        &self,
+        source: WindowId,
+        data: Box<dyn DataTransferSend>,
+        actions: &[DndAction],
+        _icon: Option<DragIcon>,
+        internal: bool,
+    ) -> Result<DataTransferId, TransferError> {
         if !actions.contains(&DndAction::Copy) {
             return Err(NotSupportedError::new("X11 drag sources only support copying").into());
         }
@@ -971,6 +1006,14 @@ impl RootActiveEventLoop for ActiveEventLoop {
         else {
             return Err(TransferError::Failed);
         };
+        let local_windows = internal.then(|| {
+            self.windows
+                .borrow()
+                .iter()
+                .filter(|(_, window)| window.strong_count() != 0)
+                .map(|(id, _)| id.into_raw() as xproto::Window)
+                .collect()
+        });
         let drag = DragSource::start(
             self.xconn.clone(),
             source.into_raw() as _,
@@ -978,23 +1021,12 @@ impl RootActiveEventLoop for ActiveEventLoop {
             device,
             !window.is_decorated(),
             data,
+            local_windows,
         )
         .map_err(|err| TransferError::Os(os_error!(err)))?;
         let id = drag.id();
         *outgoing = Some(drag);
         Ok(id)
-    }
-
-    fn clipboard(&self) -> Result<Option<DataTransferId>, TransferError> {
-        self.read_clipboard(ClipboardSelectionType::Clipboard)
-    }
-
-    fn set_clipboard(&self, send_data: Box<dyn DataTransferSend>) -> Result<(), TransferError> {
-        self.write_clipboard(ClipboardSelectionType::Clipboard, send_data)
-    }
-
-    fn primary_selection_ext(&self) -> Option<&dyn PrimarySelectionExt> {
-        Some(self)
     }
 }
 

@@ -345,6 +345,25 @@ pub trait ActiveEventLoop: Any + fmt::Debug {
         Err(DATA_TRANSFER_NOT_SUPPORTED)
     }
 
+    /// Start a native drag limited to destinations in this application.
+    ///
+    /// The OS feedback and final drop must reject external windows. The
+    /// destination still selects an action and validates the received data.
+    /// This does not make the format name secret.
+    ///
+    /// Returns `NotSupported` if the backend cannot restrict the destination.
+    /// Currently implemented by the Win32, AppKit and X11 backends.
+    fn start_internal_drag(
+        &self,
+        source: WindowId,
+        send_data: Box<dyn DataTransferSend>,
+        actions: &[DndAction],
+        icon: Option<DragIcon>,
+    ) -> Result<DataTransferId, TransferError> {
+        let _ = (source, send_data, actions, icon);
+        Err(DATA_TRANSFER_NOT_SUPPORTED)
+    }
+
     /// Get the current clipboard contents as a [data transfer](crate::data_transfer), or `None`
     /// if the clipboard is empty.
     ///

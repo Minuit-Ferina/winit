@@ -83,6 +83,7 @@ pub(crate) struct DragSource {
     data: Box<dyn DataTransferSend>,
     types: Vec<xproto::Atom>,
     custom_types: Vec<SelectionType>,
+    local_windows: Option<Vec<xproto::Window>>,
     root: xproto::Window,
     device: xinput::DeviceId,
     source_borderless: bool,
@@ -102,6 +103,7 @@ impl DragSource {
         device: xinput::DeviceId,
         source_borderless: bool,
         data: Box<dyn DataTransferSend>,
+        local_windows: Option<Vec<xproto::Window>>,
     ) -> Result<Self, X11Error> {
         let atoms = xconn.atoms();
         let conn = xconn.xcb_connection();
@@ -145,6 +147,7 @@ impl DragSource {
             data,
             types,
             custom_types,
+            local_windows,
             root,
             device,
             source_borderless,
@@ -209,15 +212,21 @@ impl DragSource {
         }
         let position = Position { x, y, time };
         let top = child_at(&self.xconn, self.root, self.root, position);
-        let target = top.and_then(|frame| {
-            target_at(
-                &self.xconn,
-                self.root,
-                frame,
-                position,
-                self.source_borderless.then_some(self.source),
-            )
-        });
+        let target = top
+            .and_then(|frame| {
+                target_at(
+                    &self.xconn,
+                    self.root,
+                    frame,
+                    position,
+                    self.source_borderless.then_some(self.source),
+                )
+            })
+            .filter(|target| {
+                self.local_windows.as_ref().is_none_or(|windows| {
+                    windows.contains(&target.window) && windows.contains(&target.recipient)
+                })
+            });
 
         trace!(source = self.source, x, y, ?top, ?target, "XDND source hit test");
         if self.hover.as_ref().map(|hover| hover.target) != target {
@@ -368,6 +377,9 @@ impl DragSource {
         target: xproto::Atom,
         property: xproto::Atom,
     ) -> Result<bool, X11Error> {
+        if self.local_windows.as_ref().is_some_and(|windows| !windows.contains(&requestor)) {
+            return Ok(false);
+        }
         let atoms = self.xconn.atoms();
         if target == atoms[TARGETS] {
             let mut types = vec![atoms[TARGETS]];

@@ -33,15 +33,16 @@ pub(super) struct PendingDrag {
     pub(super) data_object: SourceDataObject,
     pub(super) drop_source: DropSource,
     pub(super) allowed_effects: DropEffect,
+    pub(super) has_drag_image: bool,
     pub(super) id: DataTransferId,
 }
 
-/// Set while `DoDragDrop` is on the call stack - i.e., this process is the source of an active
-/// drag. The target-side `IDropTarget` checks this to recognize self-drops and reuse the source's
-/// id + allowed actions instead of waiting for the (buffered) app `DragEntered` handler.
+/// Metadata for the in-process source while the OLE drag loop is running.
 #[derive(Copy, Clone)]
 pub(crate) struct SourceDrag {
     pub(crate) id: DataTransferId,
+    pub(crate) has_standard_formats: bool,
+    pub(crate) has_drag_image: bool,
 }
 
 pub(crate) struct EventLoopRunner {
@@ -152,23 +153,31 @@ impl EventLoopRunner {
         if self.should_buffer() || self.source_drag.get().is_some() {
             return;
         }
-        let Some(PendingDrag { data_object, drop_source, id, allowed_effects, window_id }) =
-            self.pending_drag.take()
+        let Some(PendingDrag {
+            data_object,
+            drop_source,
+            id,
+            allowed_effects,
+            window_id,
+            has_drag_image,
+        }) = self.pending_drag.take()
         else {
             return;
         };
 
-        // Make the drag visible to our own target-side `IDropTarget` so it can recognize
-        // self-drops and reuse this id + action mask without going through the (buffered) app
-        // handler. The guard ensures the flag is cleared on any exit path - if anything between
-        // here and DoDragDrop's return panics, a stale flag would misclassify later drags.
+        // Let our target reuse the source's metadata. Clear it on every exit so
+        // the next external offer is handled through its native data object.
         struct ClearOnDrop<'a>(&'a Cell<Option<SourceDrag>>);
         impl Drop for ClearOnDrop<'_> {
             fn drop(&mut self) {
                 self.0.set(None);
             }
         }
-        self.source_drag.set(Some(SourceDrag { id }));
+        self.source_drag.set(Some(SourceDrag {
+            id,
+            has_standard_formats: data_object.has_standard_formats(),
+            has_drag_image,
+        }));
         let _guard = ClearOnDrop(&self.source_drag);
 
         let mut effect_out: u32 = DROPEFFECT_NONE;

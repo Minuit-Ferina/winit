@@ -102,7 +102,7 @@ impl ApplicationHandler for Example {
                         .with_type(format.clone(), |bytes, _| Some(bytes.clone()))
                         .build();
                     if let Err(error) =
-                        event_loop.start_drag(window, offer, &[DndAction::Copy], None)
+                        event_loop.start_internal_drag(window, offer, &[DndAction::Copy], None)
                     {
                         tracing::error!("Could not start drag: {error}");
                     }

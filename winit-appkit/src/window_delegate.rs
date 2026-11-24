@@ -395,9 +395,9 @@ define_class!(
         fn dragging_session_source_operation_mask(
             &self,
             _: &NSDraggingSession,
-            _: NSDraggingContext,
+            context: NSDraggingContext,
         ) -> NSDragOperation {
-            self.view().drag_operations()
+            self.view().drag_operations(context == NSDraggingContext::WithinApplication)
         }
 
         #[unsafe(method(draggingSession:endedAtPoint:operation:))]

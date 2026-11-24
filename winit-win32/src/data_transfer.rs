@@ -7,7 +7,7 @@ use std::ops::{BitOr, ControlFlow};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::ptr::NonNull;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{self, AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -40,6 +40,9 @@ use windows_sys::Win32::System::SystemServices::{
     MK_LBUTTON, MK_MBUTTON, MK_RBUTTON, MK_XBUTTON1, MK_XBUTTON2,
 };
 use windows_sys::Win32::UI::Shell::{DROPFILES, DragQueryFileW, HDROP};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetCursorPos, HCURSOR, IDC_NO, IsChild, LoadCursorW, SetCursor, WindowFromPoint,
+};
 use windows_sys::core::{BOOL, GUID, HRESULT, IID_IUnknown};
 use winit_core::data_transfer::{
     CustomDragFormat, DataTransfer, DataTransferId, DataTransferSend, SendData, TransferType,
@@ -501,6 +504,7 @@ pub struct FileDropHandlerData {
     // makes the source's `IDragSourceHelper` bitmap actually render under the cursor over our
     // own window and any other helper-aware target.
     drop_target_helper: Option<NonNull<IDropTargetHelper>>,
+    active_drop_target_helper: Option<NonNull<IDropTargetHelper>>,
 }
 
 pub struct FileDropHandler {
@@ -527,6 +531,7 @@ impl FileDropHandler {
                 .filter_map(|format| Some((custom_drag_format_id(format)?, format.clone())))
                 .collect(),
             drop_target_helper: None,
+            active_drop_target_helper: None,
         });
         FileDropHandler { data: Box::into_raw(data) }
     }
@@ -623,20 +628,20 @@ impl FileDropHandler {
         pdwEffect: *mut u32,
     ) -> HRESULT {
         let drop_handler = unsafe { Self::from_interface(this) };
-        // If this is a self-drop (we initiated the drag from this process), reuse the source's id
-        // and seed actions from the mask declared at `start_drag` - the app's `DragEntered`
-        // handler can't call `set_valid_actions` in time because it's buffered until `DoDragDrop`
-        // returns.
-        let data_transfer_id = drop_handler
-            .runner
-            .source_drag
-            .get()
-            .map_or_else(next_data_transfer_id, |info| info.id);
+        let source = drop_handler.runner.source_drag.get();
+        let data_transfer_id = source.map_or_else(next_data_transfer_id, |source| source.id);
         drop_handler.active_data_transfer_id = Some(data_transfer_id);
 
         let wid = WindowId::from_raw(drop_handler.window.addr());
 
-        let data = Arc::new(unsafe { DataObject::from_idataobject(pDataObj) }.unwrap_or_default());
+        // Local custom-only drags have no file, text or image payload to
+        // probe. Their formats are negotiated by metadata below.
+        let data = if source.is_none_or(|source| source.has_standard_formats) {
+            unsafe { DataObject::from_idataobject(pDataObj) }.unwrap_or_default()
+        } else {
+            DataObject::default()
+        };
+        let data = Arc::new(data);
         let (custom_formats, object) =
             if drop_handler.custom_formats.is_empty() || pDataObj.is_null() {
                 (Vec::new(), None)
@@ -685,9 +690,15 @@ impl FileDropHandler {
             }
         }
 
-        // Forward to the shell drop-target helper so any drag image attached by the source's
-        // IDragSourceHelper renders the bitmap under the cursor while it's over our window.
-        if let Some(helper) = unsafe { Self::ensure_drop_target_helper(drop_handler) } {
+        // A local source already knows whether it supplied a shell image.
+        // Skip all helper calls for image-free local drags, even when cached.
+        drop_handler.active_drop_target_helper =
+            if source.is_none_or(|source| source.has_drag_image) {
+                unsafe { Self::ensure_drop_target_helper(drop_handler) }
+            } else {
+                None
+            };
+        if let Some(helper) = drop_handler.active_drop_target_helper {
             let vtbl = unsafe { Self::helper_vtbl(helper) };
             unsafe {
                 (vtbl.DragEnter)(
@@ -744,7 +755,7 @@ impl FileDropHandler {
             pdwEffect.write(new_effect);
         }
 
-        if let Some(helper) = drop_handler.drop_target_helper {
+        if let Some(helper) = drop_handler.active_drop_target_helper {
             let vtbl = unsafe { Self::helper_vtbl(helper) };
             unsafe { (vtbl.DragOver)(helper.as_ptr(), &pt_screen, new_effect) };
         }
@@ -761,7 +772,7 @@ impl FileDropHandler {
         (drop_handler.send_event)(WindowEvent::DragLeft { id: data_transfer_id });
         drop_handler.runner.data_transfer().remove_drag(data_transfer_id);
 
-        if let Some(helper) = drop_handler.drop_target_helper {
+        if let Some(helper) = drop_handler.active_drop_target_helper.take() {
             let vtbl = unsafe { Self::helper_vtbl(helper) };
             unsafe { (vtbl.DragLeave)(helper.as_ptr()) };
         }
@@ -829,7 +840,7 @@ impl FileDropHandler {
                 *pdwEffect = effect;
             }
 
-            if let Some(helper) = drop_handler.drop_target_helper {
+            if let Some(helper) = drop_handler.active_drop_target_helper.take() {
                 let vtbl = unsafe { Self::helper_vtbl(helper) };
                 unsafe {
                     (vtbl.Drop)(helper.as_ptr(), pDataObj as *mut IDataObject, &pt_screen, effect);
@@ -1876,6 +1887,14 @@ impl SourceDataObject {
         Self { data: SourceDataObjectData::new_boxed(send_data, true) }
     }
 
+    pub(crate) fn has_standard_formats(&self) -> bool {
+        // SAFETY: The wrapper owns a reference and the format list is immutable.
+        unsafe { &*self.data }
+            .formats
+            .iter()
+            .any(|(_, format)| matches!(format, SourceFormat::Standard(_)))
+    }
+
     pub(crate) fn interface_ptr(&self) -> *mut c_void {
         self.data as *mut c_void
     }
@@ -1899,21 +1918,59 @@ struct IDropSourceInterface {
 struct DropSourceData {
     interface: IDropSourceInterface,
     refcount: AtomicUsize,
+    internal: Option<(Weak<EventLoopRunner>, DataTransferId)>,
+    forbidden_cursor: HCURSOR,
 }
 
 com_iunknown_impl!(DropSourceData, &IID_IDropSource);
 
 #[allow(non_snake_case)]
 impl DropSourceData {
-    fn new_boxed() -> *mut Self {
+    fn new_boxed(internal: Option<(Weak<EventLoopRunner>, DataTransferId)>) -> *mut Self {
+        let forbidden_cursor = if internal.is_some() {
+            // SAFETY: IDC_NO is a shared system cursor and does not need destruction.
+            unsafe { LoadCursorW(std::ptr::null_mut(), IDC_NO) }
+        } else {
+            std::ptr::null_mut()
+        };
         Box::into_raw(Box::new(Self {
             interface: IDropSourceInterface { lpVtbl: &DROP_SOURCE_VTBL as *const IDropSourceVtbl },
             refcount: AtomicUsize::new(1),
+            internal,
+            forbidden_cursor,
         }))
     }
 
+    fn local_target(&self) -> Option<HWND> {
+        let (runner, id) = self.internal.as_ref()?;
+        let runner = runner.upgrade()?;
+        let window = runner.data_transfer().drag_state(*id)?.window_id;
+        Some(window.into_raw() as HWND)
+    }
+
+    fn permits_drop(&self) -> bool {
+        if self.internal.is_none() {
+            return true;
+        }
+        let Some(target) = self.local_target() else {
+            return false;
+        };
+        // OLE may ask whether to drop before a queued DragLeave. Confirm the
+        // current pointer location still belongs to the registered target.
+        let mut position = POINT { x: 0, y: 0 };
+        // SAFETY: position is a live output pointer. WindowFromPoint and IsChild
+        // accept HWND values returned by the OS without dereferencing them.
+        unsafe {
+            if GetCursorPos(&mut position) == 0 {
+                return false;
+            }
+            let hovered = WindowFromPoint(position);
+            hovered == target || IsChild(target, hovered) != 0
+        }
+    }
+
     unsafe extern "system" fn QueryContinueDrag(
-        _this: *mut IDropSource,
+        this: *mut IDropSource,
         escape_pressed: BOOL,
         grf_key_state: u32,
     ) -> HRESULT {
@@ -1927,12 +1984,25 @@ impl DropSourceData {
             return DRAGDROP_S_CANCEL;
         }
         if (grf_key_state & ANY_MOUSE_BUTTON) == 0 {
-            return DRAGDROP_S_DROP;
+            // SAFETY: OLE calls this with the source interface we registered.
+            let source = unsafe { &*this.cast::<Self>() };
+            return if source.permits_drop() { DRAGDROP_S_DROP } else { DRAGDROP_S_CANCEL };
         }
         S_OK
     }
 
-    unsafe extern "system" fn GiveFeedback(_this: *mut IDropSource, _dw_effect: u32) -> HRESULT {
+    unsafe extern "system" fn GiveFeedback(this: *mut IDropSource, effect: u32) -> HRESULT {
+        // SAFETY: OLE calls this with the source interface we registered.
+        let source = unsafe { &*this.cast::<Self>() };
+        // OLE has already entered or left the target by this point. Reuse
+        // that notification instead of hit-testing during every mouse move.
+        if !source.forbidden_cursor.is_null()
+            && (effect == DROPEFFECT_NONE || source.local_target().is_none())
+        {
+            // SAFETY: The handle refers to the shared IDC_NO system cursor.
+            unsafe { SetCursor(source.forbidden_cursor) };
+            return S_OK;
+        }
         DRAGDROP_S_USEDEFAULTCURSORS
     }
 }
@@ -1952,8 +2022,8 @@ pub(crate) struct DropSource {
 }
 
 impl DropSource {
-    pub(crate) fn new() -> Self {
-        Self { data: DropSourceData::new_boxed() }
+    pub(crate) fn new(internal: Option<(Weak<EventLoopRunner>, DataTransferId)>) -> Self {
+        Self { data: DropSourceData::new_boxed(internal) }
     }
 
     pub(crate) fn interface_ptr(&self) -> *mut c_void {
@@ -2162,6 +2232,35 @@ mod custom_drag_tests {
     use super::*;
 
     #[test]
+    fn internal_source_cancels_release_without_a_live_local_target() {
+        let internal = DropSource::new(Some((Weak::new(), next_data_transfer_id())));
+        let unrestricted = DropSource::new(None);
+        // SAFETY: The source objects own the interfaces throughout the calls.
+        unsafe {
+            assert_eq!(
+                DropSourceData::QueryContinueDrag(internal.interface_ptr().cast(), 0, MK_LBUTTON),
+                S_OK
+            );
+            assert_eq!(
+                DropSourceData::QueryContinueDrag(internal.interface_ptr().cast(), 0, 0),
+                DRAGDROP_S_CANCEL
+            );
+            assert_eq!(
+                DropSourceData::QueryContinueDrag(unrestricted.interface_ptr().cast(), 0, 0),
+                DRAGDROP_S_DROP
+            );
+            assert_eq!(
+                DropSourceData::QueryContinueDrag(
+                    unrestricted.interface_ptr().cast(),
+                    1,
+                    MK_LBUTTON
+                ),
+                DRAGDROP_S_CANCEL
+            );
+        }
+    }
+
+    #[test]
     fn custom_ole_offer_checks_metadata_before_asking_for_data() {
         let format = CustomDragFormat::new("org.example.custom-drag-test").unwrap();
         let native = custom_drag_format_id(&format).unwrap();
@@ -2177,6 +2276,7 @@ mod custom_drag_tests {
             })
             .build();
         let source = SourceDataObject::for_drag(offer);
+        assert!(!source.has_standard_formats());
         // SAFETY: SourceDataObject owns a live IDataObject on this thread.
         let incoming = unsafe { IncomingDataObject::retain(source.interface_ptr().cast()) };
         drop(source);
@@ -2188,6 +2288,16 @@ mod custom_drag_tests {
         assert_eq!(reads.load(Ordering::SeqCst), 0);
         assert_eq!(incoming.read_bytes(native), Some(bytes));
         assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_mixed_source_keeps_its_standard_payload() {
+        let format = CustomDragFormat::new("org.example.mixed-drag-test").unwrap();
+        let offer = DataTransferSendBuilder::new("text")
+            .with_type(format, |text, _| Some(text.as_bytes().to_vec()))
+            .with_type(TypeHint::Plaintext, |text, _| Some(text.to_string()))
+            .build();
+        assert!(SourceDataObject::for_drag(offer).has_standard_formats());
     }
 
     #[test]

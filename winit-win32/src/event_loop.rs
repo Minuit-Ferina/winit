@@ -614,6 +614,29 @@ impl RootActiveEventLoop for ActiveEventLoop {
         allowed_actions: &[DndAction],
         icon: Option<DragIcon>,
     ) -> Result<DataTransferId, TransferError> {
+        self.start_drag_impl(source, send_data, allowed_actions, icon, false)
+    }
+
+    fn start_internal_drag(
+        &self,
+        source: WindowId,
+        send_data: Box<dyn DataTransferSend>,
+        allowed_actions: &[DndAction],
+        icon: Option<DragIcon>,
+    ) -> Result<DataTransferId, TransferError> {
+        self.start_drag_impl(source, send_data, allowed_actions, icon, true)
+    }
+}
+
+impl ActiveEventLoop {
+    fn start_drag_impl(
+        &self,
+        source: WindowId,
+        send_data: Box<dyn DataTransferSend>,
+        allowed_actions: &[DndAction],
+        icon: Option<DragIcon>,
+        internal: bool,
+    ) -> Result<DataTransferId, TransferError> {
         if self.0.source_drag.get().is_some() || self.0.pending_drag.borrow().is_some() {
             return Err(TransferError::Failed);
         }
@@ -631,10 +654,11 @@ impl RootActiveEventLoop for ActiveEventLoop {
 
         let id = crate::data_transfer::next_data_transfer_id();
         let data_object = SourceDataObject::for_drag(send_data);
-        let drop_source = DropSource::new();
+        let drop_source = DropSource::new(internal.then(|| (Rc::downgrade(&self.0), id)));
 
         // Attach a drag preview if the app supplied one. Cosmetic failures must not abort the
         // drag - the gesture still works, just without a custom image - so log and move on.
+        let mut has_drag_image = false;
         if let Some(icon) = icon {
             if let Some(rgba) = icon.icon.cast_ref::<winit_core::icon::RgbaIcon>() {
                 let result = unsafe {
@@ -647,8 +671,9 @@ impl RootActiveEventLoop for ActiveEventLoop {
                         icon.offset_y,
                     )
                 };
-                if let Err(hr) = result {
-                    tracing::warn!("Failed to attach drag image: hr=0x{hr:08x}");
+                match result {
+                    Ok(()) => has_drag_image = true,
+                    Err(hr) => tracing::warn!("Failed to attach drag image: hr=0x{hr:08x}"),
                 }
             } else {
                 tracing::warn!("DragIcon::icon must be an RgbaIcon on win32; ignoring");
@@ -661,6 +686,7 @@ impl RootActiveEventLoop for ActiveEventLoop {
             data_object,
             drop_source,
             allowed_effects,
+            has_drag_image,
         }));
 
         Ok(id)

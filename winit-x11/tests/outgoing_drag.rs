@@ -261,8 +261,12 @@ impl ApplicationHandler for DragTest {
                         .with_type(TypeHint::Plaintext, |value, _| Some(value.to_string()))
                         .build()
                 };
-                self.transfer =
-                    Some(event_loop.start_drag(window, data, &[DndAction::Copy], None).unwrap());
+                let drag = if self.scenario.custom() {
+                    event_loop.start_internal_drag(window, data, &[DndAction::Copy], None)
+                } else {
+                    event_loop.start_drag(window, data, &[DndAction::Copy], None)
+                };
+                self.transfer = Some(drag.unwrap());
             },
             WindowEvent::DragPosition { id, .. } if target => {
                 self.visited_destination = true;

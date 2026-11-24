@@ -262,6 +262,29 @@ impl RootActiveEventLoop for ActiveEventLoop {
         actions: &[DndAction],
         icon: Option<DragIcon>,
     ) -> Result<DataTransferId, TransferError> {
+        self.start_drag_impl(source, send_data, actions, icon, false)
+    }
+
+    fn start_internal_drag(
+        &self,
+        source: WindowId,
+        send_data: Box<dyn DataTransferSend>,
+        actions: &[DndAction],
+        icon: Option<DragIcon>,
+    ) -> Result<DataTransferId, TransferError> {
+        self.start_drag_impl(source, send_data, actions, icon, true)
+    }
+}
+
+impl ActiveEventLoop {
+    fn start_drag_impl(
+        &self,
+        source: WindowId,
+        send_data: Box<dyn DataTransferSend>,
+        actions: &[DndAction],
+        icon: Option<DragIcon>,
+        internal: bool,
+    ) -> Result<DataTransferId, TransferError> {
         let drag_operation = dnd_actions_to_ns_drag_operation(actions);
 
         self.app_state
@@ -344,6 +367,7 @@ impl RootActiveEventLoop for ActiveEventLoop {
 
                 let pasteboard_items = NSArray::from_retained_slice(&pasteboard_items);
 
+                delegate.view().prepare_dragging_session(drag_operation, internal);
                 let session = delegate.window().beginDraggingSessionWithItems_event_source(
                     &pasteboard_items,
                     &event,
@@ -352,7 +376,7 @@ impl RootActiveEventLoop for ActiveEventLoop {
 
                 let id = DataTransferId::from_raw(session.draggingSequenceNumber() as i64);
 
-                delegate.view().set_dragging_session(session, drag_operation);
+                delegate.view().set_dragging_session(session);
 
                 Ok(id)
             })

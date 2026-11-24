@@ -118,6 +118,7 @@ pub struct ViewState {
 
     /// This is for a dragging session that we initiated
     dragging_session: RefCell<Option<Retained<NSDraggingSession>>>,
+    internal_drag: Cell<bool>,
 
     /// This is for a dragging session that we initiated
     drag_operations: Cell<NSDragOperation>,
@@ -864,6 +865,7 @@ impl WinitView {
         let this = mtm.alloc().set_ivars(ViewState {
             app_state: Rc::clone(app_state),
             dragging_session: Default::default(),
+            internal_drag: Cell::new(false),
             drag_operations: Cell::new(NSDragOperation::empty()),
             cursor_state: Default::default(),
             ime_position: Default::default(),
@@ -1205,18 +1207,22 @@ impl WinitView {
         self.queue_event(WindowEvent::ModifiersChanged(self.ivars().modifiers.get()));
     }
 
-    pub(crate) fn set_dragging_session(
-        &self,
-        drag: Retained<NSDraggingSession>,
-        action_mask: NSDragOperation,
-    ) {
-        let vars = self.ivars();
-        vars.dragging_session.replace(Some(drag));
-        vars.drag_operations.set(action_mask);
+    pub(crate) fn prepare_dragging_session(&self, action_mask: NSDragOperation, internal: bool) {
+        self.ivars().drag_operations.set(action_mask);
+        self.ivars().internal_drag.set(internal);
     }
 
-    pub(crate) fn drag_operations(&self) -> NSDragOperation {
-        self.ivars().drag_operations.get()
+    pub(crate) fn set_dragging_session(&self, drag: Retained<NSDraggingSession>) {
+        self.ivars().dragging_session.replace(Some(drag));
+    }
+
+    pub(crate) fn drag_operations(&self, within_application: bool) -> NSDragOperation {
+        let vars = self.ivars();
+        if vars.internal_drag.get() && !within_application {
+            NSDragOperation::empty()
+        } else {
+            vars.drag_operations.get()
+        }
     }
 
     pub(crate) fn clear_dragging_session(&self, drag: &NSDraggingSession) -> bool {
