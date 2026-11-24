@@ -502,10 +502,9 @@ impl FileDropHandler {
         pdwEffect: *mut u32,
     ) -> HRESULT {
         let drop_handler = unsafe { Self::from_interface(this) };
-        // If this is a self-drop (we initiated the drag from this process), reuse the source's id
-        // and seed actions from the mask declared at `start_drag` - the app's `DragEntered`
-        // handler can't call `set_valid_actions` in time because it's buffered until `DoDragDrop`
-        // returns.
+        // A drag initiated by this process keeps its source id when it enters our own window.
+        // The application's DragEntered callback runs before action negotiation below, so the
+        // destination can accept or reject it with set_valid_dnd_actions.
         let data_transfer_id = drop_handler
             .runner
             .source_drag
@@ -696,8 +695,8 @@ impl FileDropHandler {
         }
 
         // External drop: the app's handler dispatched synchronously above and has already read
-        // the data; safe to release the cache. Self-drop: the handler is buffered and hasn't
-        // run yet, so defer cleanup until after `dispatch_buffered_events` drains.
+        // the data. Self-drop: keep the cache through source completion, whose event dispatch
+        // drains any application events queued by the target callback before releasing it.
         if drop_handler.runner.source_drag.get().is_some() {
             drop_handler.runner.defer_source_drag_cleanup(data_transfer_id);
         } else {

@@ -13,6 +13,7 @@ use windows_sys::Win32::System::Ole::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+use windows_sys::core::HRESULT;
 use winit_core::application::ApplicationHandler;
 use winit_core::data_transfer::DataTransferId;
 use winit_core::event::{DeviceEvent, DeviceId, StartCause, SurfaceSizeWriter, WindowEvent};
@@ -37,8 +38,8 @@ pub(super) struct PendingDrag {
 }
 
 /// Set while `DoDragDrop` is on the call stack - i.e., this process is the source of an active
-/// drag. The target-side `IDropTarget` checks this to recognize self-drops and reuse the source's
-/// id + allowed actions instead of waiting for the (buffered) app `DragEntered` handler.
+/// drag. The target-side `IDropTarget` uses this to recognize self-drops and reuse the source's
+/// transfer id. The application's callbacks can run while the native drag loop is active.
 #[derive(Copy, Clone)]
 pub(crate) struct SourceDrag {
     pub(crate) id: DataTransferId,
@@ -68,7 +69,7 @@ pub(crate) struct EventLoopRunner {
     /// All currently-open windows, for events that are not tied to a single window.
     windows: RefCell<Vec<WindowId>>,
 
-    /// `Some(_)` while `start_drag` has `DoDragDrop` on the call stack.
+    /// `Some(_)` during the native drag loop and dispatch of its terminal event.
     pub(crate) source_drag: Cell<Option<SourceDrag>>,
 
     /// `DoDragDrop` is blocking and synchronous, so we wait until after the application returns
@@ -79,12 +80,9 @@ pub(crate) struct EventLoopRunner {
     /// handling those messages.
     pub(super) pending_drag: RefCell<Option<PendingDrag>>,
 
-    /// For self-drops, target-side `IDropTarget::Drop` can't release the cached `DragState`
-    /// before its `DragDropped` `WindowEvent` is delivered - the event is buffered (the outer app
-    /// handler holds `event_handler` for the duration of `DoDragDrop`) and `data_transfer(id)`
-    /// would fail with `TransferError::UnknownTransfer` if cleanup ran synchronously. So we stash
-    /// the id here and drain it at the end of `dispatch_buffered_events`, after the app's buffered
-    /// handler has had its chance to read the data.
+    /// A self-drop retains its cached `DragState` until the next buffered-event drain, normally
+    /// after the source's terminal event. Target callbacks can run inside `DoDragDrop`; retaining
+    /// the cache also covers events queued by a nested application callback before that drain.
     pending_source_drag_cleanup: Cell<Option<DataTransferId>>,
 
     panic_error: Cell<Option<PanicError>>,
@@ -146,22 +144,39 @@ impl EventLoopRunner {
     }
 
     pub(super) fn try_execute_drag_drop(self: &Rc<Self>) {
+        self.try_execute_drag_drop_with(|pending, effect_out| {
+            // SAFETY: PendingDrag owns both COM objects throughout the synchronous native call.
+            // Their interface pointers remain valid, and effect_out is writable for the call.
+            unsafe {
+                DoDragDrop(
+                    pending.data_object.interface_ptr(),
+                    pending.drop_source.interface_ptr(),
+                    pending.allowed_effects,
+                    effect_out,
+                )
+            }
+        });
+    }
+
+    // Keep the native modal call replaceable in tests so they exercise the actual handler,
+    // pending-drag and completion lifetimes without taking over the desktop pointer.
+    fn try_execute_drag_drop_with(
+        self: &Rc<Self>,
+        do_drag_drop: impl FnOnce(&PendingDrag, &mut u32) -> HRESULT,
+    ) {
         // A nested window procedure can run while an application callback
         // is still on the stack. Wait until the handler is available so the
         // OLE loop can deliver hover and redraw events during this drag.
         if self.should_buffer() || self.source_drag.get().is_some() {
             return;
         }
-        let Some(PendingDrag { data_object, drop_source, id, allowed_effects, window_id }) =
-            self.pending_drag.take()
-        else {
-            return;
-        };
+        let Some(pending) = self.pending_drag.take() else { return };
+        let id = pending.id;
+        let window_id = pending.window_id;
 
         // Make the drag visible to our own target-side `IDropTarget` so it can recognize
-        // self-drops and reuse this id + action mask without going through the (buffered) app
-        // handler. The guard ensures the flag is cleared on any exit path - if anything between
-        // here and DoDragDrop's return panics, a stale flag would misclassify later drags.
+        // self-drops and reuse the transfer id. Clear the flag on every exit path, including
+        // unwinding through the native call, so later drags cannot inherit a stale source.
         struct ClearOnDrop<'a>(&'a Cell<Option<SourceDrag>>);
         impl Drop for ClearOnDrop<'_> {
             fn drop(&mut self) {
@@ -172,14 +187,7 @@ impl EventLoopRunner {
         let _guard = ClearOnDrop(&self.source_drag);
 
         let mut effect_out: u32 = DROPEFFECT_NONE;
-        let hr = unsafe {
-            DoDragDrop(
-                data_object.interface_ptr(),
-                drop_source.interface_ptr(),
-                allowed_effects,
-                &mut effect_out,
-            )
-        };
+        let hr = do_drag_drop(&pending, &mut effect_out);
 
         if hr == DRAGDROP_S_DROP {
             let action = drop_effect_to_dnd_action(effect_out);
@@ -199,7 +207,7 @@ impl EventLoopRunner {
         }
 
         // Both `DRAGDROP_S_DROP` and `DRAGDROP_S_CANCEL` are success codes for us - the app
-        // will hear about the outcome via the buffered `DragDropped`/`DragLeft` events
+        // has heard about an in-process target's outcome via `DragDropped`/`DragLeft`
         // (target-side translates `effect_out == DROPEFFECT_NONE` to `DragLeft`).
         // Log the negotiated effect so cross-process drops, which have no target-side event
         // in this process, leave a debuggable trace of what action the remote target performed.
@@ -603,3 +611,6 @@ impl Event {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
