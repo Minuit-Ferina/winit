@@ -69,7 +69,7 @@ try:
     begin(target_color, 1)
     wait_for(app_log, "TARGET_ENTER true")
     input_("mouseup", 1)
-    wait_for(app_log, "DROPPED Copy")
+    wait_for(app_log, "DROPPED Some(Copy)")
     wait_for(app_log, "RECEIVED [1, 0, 0, 0, 0, 0, 0, 0, 0]")
 
     foreign = launch(foreign_log, "text")
@@ -101,7 +101,7 @@ try:
     wait_for(foreign_log, "FOREIGN_EMPTY")
 
     lines = app_log.read_text().splitlines()
-    assert lines.count("DROPPED Copy") == 2, lines
+    assert lines.count("DROPPED Some(Copy)") == 2, lines
     assert lines.count("TARGET_DROP") == 2, lines
     assert lines.count("CANCEL") == 3, lines
     print("Passed: internal copy, external refusal, Escape, copy after Escape, marker without payload")

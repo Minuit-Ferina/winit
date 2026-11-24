@@ -18,10 +18,10 @@ jobs:
       - name: Install the compositor and input tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y mutter xvfb xauth xdotool dbus-x11 python3-pil scrot libxkbcommon-dev
+          sudo apt-get install -y mutter xvfb xauth xdotool dbus-x11 python3-pil libxkbcommon-dev libdbus-1-dev
       - name: Build the Wayland-only demo and test the backend
         run: |
-          cargo test -p winit-wayland
+          cargo test -p winit-wayland --features portal
           cargo build -p winit --example wayland_internal_drag --no-default-features --features wayland,wayland-dlopen
       - name: Exercise native drag gestures
         run: |

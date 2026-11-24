@@ -126,6 +126,9 @@ impl ApplicationHandler for Example {
                     let format = if self.send_unknown { &self.unknown } else { &self.format };
                     let offer = DataTransferSendBuilder::new(bytes)
                         .with_type(format.clone(), |bytes, _| Some(bytes.clone()))
+                        .with_type(TypeHint::Plaintext, |_, _| {
+                            Some("In-process test text".to_owned())
+                        })
                         .build();
                     if let Err(error) =
                         event_loop.start_internal_drag(window, offer, &[DndAction::Copy], None)
