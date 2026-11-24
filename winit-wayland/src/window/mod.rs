@@ -110,6 +110,7 @@ impl Window {
             None,
         );
 
+        window_state.custom_drag_formats = attributes.custom_drag_formats;
         window_state.set_window_icon(attributes.window_icon);
 
         // Set transparency hint.

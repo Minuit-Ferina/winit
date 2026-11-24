@@ -178,9 +178,23 @@ pub struct WindowAttributes {
     pub window_type: WindowType,
     /// See [`WindowAttributes::with_positioner`].
     pub positioner: Option<WindowPositioner>,
+    /// Additional named binary formats this window can receive via drag and drop.
+    pub custom_drag_formats: Vec<crate::data_transfer::CustomDragFormat>,
 }
 
 impl WindowAttributes {
+    /// Declare the additional binary drag formats this window can receive.
+    ///
+    /// Standard formats remain available. Use the drag events to decide whether
+    /// to accept an offered format for a particular drop.
+    pub fn with_custom_drag_formats(
+        mut self,
+        formats: impl IntoIterator<Item = crate::data_transfer::CustomDragFormat>,
+    ) -> Self {
+        self.custom_drag_formats = formats.into_iter().collect();
+        self
+    }
+
     /// Get the parent window stored on the attributes.
     pub fn parent_window(&self) -> Option<&rwh_06::RawWindowHandle> {
         self.parent_window.as_ref().map(|handle| &handle.0)
@@ -561,6 +575,7 @@ impl Clone for WindowAttributes {
             platform: self.platform.as_ref().map(|platform| platform.box_clone()),
             window_type: self.window_type,
             positioner: self.positioner,
+            custom_drag_formats: self.custom_drag_formats.clone(),
         }
     }
 }
@@ -593,6 +608,7 @@ impl Default for WindowAttributes {
             blur: Default::default(),
             window_type: Default::default(),
             positioner: Default::default(),
+            custom_drag_formats: Vec::new(),
         }
     }
 }

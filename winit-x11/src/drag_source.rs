@@ -82,6 +82,7 @@ pub(crate) struct DragSource {
     source: xproto::Window,
     data: Box<dyn DataTransferSend>,
     types: Vec<xproto::Atom>,
+    custom_types: Vec<SelectionType>,
     root: xproto::Window,
     device: xinput::DeviceId,
     source_borderless: bool,
@@ -125,7 +126,7 @@ impl DragSource {
             }
         }
 
-        let types = advertised_types(&xconn, &*data);
+        let (types, custom_types) = advertised_types(&xconn, &*data);
         if types.is_empty() {
             return Err(X11Error::UnexpectedNull("supported XDND data types"));
         }
@@ -143,6 +144,7 @@ impl DragSource {
             source,
             data,
             types,
+            custom_types,
             root,
             device,
             source_borderless,
@@ -219,13 +221,7 @@ impl DragSource {
 
         trace!(source = self.source, x, y, ?top, ?target, "XDND source hit test");
         if self.hover.as_ref().map(|hover| hover.target) != target {
-            debug!(
-                source = self.source,
-                ?target,
-                x,
-                y,
-                "XDND source changed target"
-            );
+            debug!(source = self.source, ?target, x, y, "XDND source changed target");
             self.leave();
             if let Some(target) = target {
                 let mut data = [self.source, target.version << 24, NONE, NONE, NONE];
@@ -390,7 +386,13 @@ impl DragSource {
         if !self.types.contains(&target) {
             return Ok(false);
         }
-        let Some(data) = self.data.data_for_type(&SelectionType::new(atoms, target)) else {
+        let ty = self
+            .custom_types
+            .iter()
+            .find(|ty| ty.atom() == target)
+            .cloned()
+            .unwrap_or_else(|| SelectionType::new(atoms, target));
+        let Some(data) = self.data.data_for_type(&ty) else {
             return Ok(false);
         };
         let bytes = match data {
@@ -479,18 +481,30 @@ impl Drop for DragSource {
     }
 }
 
-fn advertised_types(xconn: &XConnection, data: &dyn DataTransferSend) -> Vec<xproto::Atom> {
+fn advertised_types(
+    xconn: &XConnection,
+    data: &dyn DataTransferSend,
+) -> (Vec<xproto::Atom>, Vec<SelectionType>) {
     let mut types = Vec::new();
+    let mut custom_types = Vec::new();
     data.for_each_available_type(&mut |ty| {
-        for ty in SelectionType::from_dyn(xconn.atoms(), ty) {
+        let custom_atom = ty.custom_drag_format().and_then(|format| {
+            let ty = SelectionType::from_custom_drag_format(xconn, format)?;
             let atom = ty.atom();
+            custom_types.push(ty);
+            Some(atom)
+        });
+        for atom in custom_atom
+            .into_iter()
+            .chain(SelectionType::from_dyn(xconn.atoms(), ty).map(|ty| ty.atom()))
+        {
             if !types.contains(&atom) {
                 types.push(atom);
             }
         }
         std::ops::ControlFlow::Continue(())
     });
-    types
+    (types, custom_types)
 }
 
 fn target_at(

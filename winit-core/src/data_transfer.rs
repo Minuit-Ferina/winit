@@ -200,6 +200,88 @@ pub struct DataTransferLimits {
     pub timeout: std::time::Duration,
 }
 
+/// An application-defined binary drag format.
+///
+/// Choose a stable reverse-domain name and use the same format on both ends of
+/// a drag. The application supplies the bytes using [`SendData::Bytes`].
+///
+/// On Windows, the native representation is registered as `winit.drag.v1.<name>`.
+/// Its little-endian 32-bit length is followed by the payload (up to 16 MiB).
+/// X11 and Wayland use `application/x.winit-drag.<name>`. AppKit uses
+/// `org.rust-windowing.winit.drag.<name>`. These three backends send raw bytes.
+/// X11 payloads must fit in one property request.
+///
+/// The name identifies a data format. A target controls the feedback and drop
+/// actions it reports to the OS. Applications must validate the received data.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CustomDragFormat(Box<str>);
+
+/// The name of a custom drag format is invalid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidCustomDragFormat;
+
+impl fmt::Display for InvalidCustomDragFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("invalid custom drag format name")
+    }
+}
+
+impl std::error::Error for InvalidCustomDragFormat {}
+
+impl CustomDragFormat {
+    /// Create a format from a stable name, such as `org.example.inventory-drag`.
+    ///
+    /// Names are at most 100 ASCII bytes and contain at least two dot-separated
+    /// labels. Labels contain lowercase ASCII letters, digits and internal hyphens.
+    pub fn new(name: &str) -> Result<Self, InvalidCustomDragFormat> {
+        if name.len() > 100
+            || !name.contains('.')
+            || !name.split('.').all(|label| {
+                !label.is_empty()
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            })
+        {
+            return Err(InvalidCustomDragFormat);
+        }
+        Ok(Self(name.into()))
+    }
+
+    /// Return the portable name.
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+
+    /// MIME representation shared by the X11 and Wayland drag backends.
+    #[doc(hidden)]
+    pub fn drag_mime_type(&self) -> String {
+        format!("application/x.winit-drag.{}", self.name())
+    }
+
+    /// Recover a portable format from its MIME representation.
+    #[doc(hidden)]
+    pub fn from_drag_mime_type(mime: &str) -> Option<Self> {
+        Self::new(mime.strip_prefix("application/x.winit-drag.")?).ok()
+    }
+}
+
+impl TransferType for CustomDragFormat {
+    fn hint(&self) -> Option<TypeHint> {
+        None
+    }
+
+    fn custom_drag_format(&self) -> Option<&CustomDragFormat> {
+        Some(self)
+    }
+
+    fn matches(&self, other: &dyn TransferType) -> bool {
+        other.custom_drag_format() == Some(self)
+    }
+}
+
 /// The type of a data transfer.
 ///
 /// [`hint`](TransferType::hint) can be called to get the type in
@@ -207,9 +289,14 @@ pub struct DataTransferLimits {
 pub trait TransferType: Any + fmt::Debug {
     /// Get the cross-platform representation of this type.
     ///
-    /// If this returns `None`, then this is a platform-dependent type that has no cross-platform
-    /// equivalent.
+    /// A `None` value indicates that this type has no standard hint. It can
+    /// still represent a portable application-defined drag format.
     fn hint(&self) -> Option<TypeHint>;
+
+    /// Return the portable identity of an application-defined drag format.
+    fn custom_drag_format(&self) -> Option<&CustomDragFormat> {
+        None
+    }
 
     /// Check whether two dynamically-typed transfer types are equivalent.
     // Can't use a `PartialEq` bound because it causes a dependency cycle.
@@ -461,9 +548,13 @@ impl<T> DataTransferSendBuilder<T> {
 
 impl<T> DataTransferSendBuilder<T> {
     fn data_for_type(&self, type_: &dyn TransferType) -> Option<SendData> {
-        let (_, func) = self.types.iter().find(|(ty, _)| ty.matches(type_))?;
+        let (ty, func) = self.types.iter().find(|(ty, _)| ty.matches(type_))?;
 
-        func(&self.state, type_)
+        let data = func(&self.state, type_)?;
+        if ty.custom_drag_format().is_some() && !matches!(data, SendData::Bytes(_)) {
+            return None;
+        }
+        Some(data)
     }
 
     /// Add a callback which converts the builder's state to the given type. In
@@ -510,5 +601,53 @@ where
     /// implements [`DataTransferSend`] and this method is equivalent to [`Box::new`].
     pub fn build(self) -> Box<dyn DataTransferSend> {
         Box::new(self)
+    }
+}
+
+#[cfg(test)]
+mod custom_drag_format_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_canonical_names() {
+        assert!(CustomDragFormat::new("org.example.inventory-drag").is_ok());
+        for name in [
+            "",
+            "example",
+            "Org.example",
+            "org..example",
+            "org.-example",
+            "org.example-",
+            "org.exámple",
+            "org.example\0",
+            "text/plain",
+        ] {
+            assert!(CustomDragFormat::new(name).is_err(), "{name:?}");
+        }
+        assert!(CustomDragFormat::new(&format!("org.{}", "x".repeat(97))).is_err());
+    }
+
+    #[test]
+    fn matches_the_portable_format_and_preserves_binary_data() {
+        let format = CustomDragFormat::new("org.example.inventory-drag").unwrap();
+        let other = CustomDragFormat::new("org.example.other").unwrap();
+        let bytes = vec![1, 0, 2, 0];
+        let data = DataTransferSendBuilder::new(bytes.clone())
+            .with_type(format.clone(), |bytes, _| Some(bytes.clone()))
+            .build();
+        let mime_type = CustomDragFormat::from_drag_mime_type(&format.drag_mime_type()).unwrap();
+        assert!(data.has_type(&mime_type));
+        assert!(!data.has_type(&other));
+        assert!(!data.has_type(&TypeHint::Plaintext));
+        assert_eq!(data.data_for_type(&mime_type), Some(SendData::Bytes(bytes)));
+    }
+
+    #[test]
+    fn custom_format_requires_bytes() {
+        let format = CustomDragFormat::new("org.example.payload").unwrap();
+        let offer = DataTransferSendBuilder::new(String::from("text"))
+            .with_type(format.clone(), |text, _| Some(text.clone()))
+            .build();
+        assert!(offer.data_for_type(&format).is_none());
     }
 }

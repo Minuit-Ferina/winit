@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use dpi::{PhysicalPosition, PhysicalSize};
 use winit_core::application::ApplicationHandler;
-use winit_core::data_transfer::{DataTransferId, DataTransferSendBuilder, TypeHint};
+use winit_core::data_transfer::{
+    CustomDragFormat, DataTransferId, DataTransferSendBuilder, TypeHint,
+};
 use winit_core::event::{ButtonSource, ElementState, MouseButton, WindowEvent};
 use winit_core::event_loop::{ActiveEventLoop, ControlFlow, DndAction};
 use winit_core::window::{Window, WindowAttributes, WindowId};
@@ -17,6 +19,11 @@ use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
 
 const PAYLOAD: &str = "winit XDND source";
+const CUSTOM_PAYLOAD: &[u8] = &[1, 0, 2, 0];
+
+fn custom_format() -> CustomDragFormat {
+    CustomDragFormat::new("org.example.xdnd-test").unwrap()
+}
 
 #[test]
 #[ignore = "requires a disposable X11 display and xdotool"]
@@ -28,6 +35,8 @@ fn completes_and_cancels_drags_between_x11_windows() {
         Scenario::CopyAcrossOverlap,
         Scenario::CopyWithinSource,
         Scenario::Reject,
+        Scenario::CustomCopy,
+        Scenario::CustomReject,
         Scenario::Escape,
         Scenario::Copy,
     ] {
@@ -47,7 +56,9 @@ fn completes_and_cancels_drags_between_x11_windows() {
         app.driver.take().unwrap().join().unwrap();
         assert!(app.visited_destination, "{scenario:?}");
         let copied = scenario.copies();
-        assert_eq!(app.received.as_deref(), copied.then_some(PAYLOAD), "{scenario:?}");
+        let expected =
+            if scenario == Scenario::CustomCopy { CUSTOM_PAYLOAD } else { PAYLOAD.as_bytes() };
+        assert_eq!(app.received.as_deref(), copied.then_some(expected), "{scenario:?}");
         assert_eq!(app.outcome, Some(copied), "{scenario:?}");
     }
 }
@@ -59,6 +70,8 @@ enum Scenario {
     CopyAcrossOverlap,
     CopyWithinSource,
     Reject,
+    CustomCopy,
+    CustomReject,
     Escape,
 }
 
@@ -66,8 +79,16 @@ impl Scenario {
     fn copies(self) -> bool {
         matches!(
             self,
-            Self::Copy | Self::CopyAcrossGap | Self::CopyAcrossOverlap | Self::CopyWithinSource
+            Self::Copy
+                | Self::CopyAcrossGap
+                | Self::CopyAcrossOverlap
+                | Self::CopyWithinSource
+                | Self::CustomCopy
         )
+    }
+
+    fn custom(self) -> bool {
+        matches!(self, Self::CustomCopy | Self::CustomReject)
     }
 
     fn target_x(self) -> i32 {
@@ -85,7 +106,7 @@ struct DragTest {
     destination: Option<Box<dyn Window>>,
     pointer_down: bool,
     transfer: Option<DataTransferId>,
-    received: Option<String>,
+    received: Option<Vec<u8>>,
     outcome: Option<bool>,
     visited_destination: bool,
     driver: Option<JoinHandle<()>>,
@@ -97,10 +118,12 @@ impl ApplicationHandler for DragTest {
         let attributes = WindowAttributes::default()
             .with_decorations(false)
             .with_surface_size(PhysicalSize::new(180, 180));
+        let custom_formats = (self.scenario == Scenario::CustomCopy).then(custom_format);
         let destination = event_loop
             .create_window(
                 attributes
                     .clone()
+                    .with_custom_drag_formats(custom_formats)
                     .with_title("winit-x11-target")
                     .with_position(PhysicalPosition::new(self.scenario.target_x(), 30)),
             )
@@ -229,27 +252,43 @@ impl ApplicationHandler for DragTest {
                     && self.transfer.is_none()
                     && position.x >= start_x =>
             {
-                let data = DataTransferSendBuilder::new(PAYLOAD)
-                    .with_type(TypeHint::Plaintext, |value, _| Some(value.to_string()))
-                    .build();
+                let data = if self.scenario.custom() {
+                    DataTransferSendBuilder::new(CUSTOM_PAYLOAD)
+                        .with_type(custom_format(), |bytes, _| Some(bytes.to_vec()))
+                        .build()
+                } else {
+                    DataTransferSendBuilder::new(PAYLOAD)
+                        .with_type(TypeHint::Plaintext, |value, _| Some(value.to_string()))
+                        .build()
+                };
                 self.transfer =
                     Some(event_loop.start_drag(window, data, &[DndAction::Copy], None).unwrap());
             },
             WindowEvent::DragPosition { id, .. } if target => {
                 self.visited_destination = true;
-                let actions = if self.scenario == Scenario::Reject {
-                    &[][..]
+                let reject = if self.scenario.custom() {
+                    !event_loop.data_transfer(id).unwrap().has_type(&custom_format())
                 } else {
-                    &[DndAction::Copy][..]
+                    self.scenario == Scenario::Reject
                 };
+                let actions = if reject { &[][..] } else { &[DndAction::Copy][..] };
                 event_loop.set_valid_dnd_actions(id, actions).unwrap();
             },
             WindowEvent::DragDropped { id, .. } if target => {
                 assert!(self.scenario.copies());
-                event_loop.fetch_data_transfer(id, &TypeHint::Plaintext).unwrap();
+                if self.scenario.custom() {
+                    event_loop.fetch_data_transfer(id, &custom_format()).unwrap();
+                } else {
+                    event_loop.fetch_data_transfer(id, &TypeHint::Plaintext).unwrap();
+                }
             },
             WindowEvent::DataTransferReceived { value, .. } if target => {
-                self.received = Some(value.try_as_string().unwrap());
+                let bytes = if self.scenario.custom() {
+                    value.try_as_bytes().unwrap()
+                } else {
+                    value.try_as_string().unwrap().into_bytes()
+                };
+                self.received = Some(bytes);
             },
             WindowEvent::OutgoingDragDropped { id, action } if source => {
                 assert_eq!(Some(id), self.transfer);

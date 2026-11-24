@@ -58,6 +58,7 @@ const MIN_WINDOW_SIZE: LogicalSize<u32> = LogicalSize::new(2, 1);
 /// The state of the window which is being updated from the [`WinitState`].
 #[derive(Debug)]
 pub struct WindowState {
+    pub(crate) custom_drag_formats: Vec<winit_core::data_transfer::CustomDragFormat>,
     /// The connection to Wayland server.
     pub handle: Arc<OwnedDisplayHandle>,
 
@@ -213,6 +214,7 @@ impl WindowState {
             .map(|toplevel_icon_manager_state| toplevel_icon_manager_state.global().clone());
 
         Self {
+            custom_drag_formats: Vec::new(),
             toplevel_icon: None,
             xdg_toplevel_icon_manager,
             blur: None,

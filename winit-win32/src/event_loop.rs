@@ -531,6 +531,15 @@ impl RootActiveEventLoop for ActiveEventLoop {
         id: DataTransferId,
         type_: &dyn TransferType,
     ) -> Result<AsyncRequestSerial, TransferError> {
+        if let Some(format) = type_.custom_drag_format() {
+            let (window_id, value) = self.0.data_transfer().read_custom_drag(id, format)?;
+            let serial = AsyncRequestSerial::get();
+            self.0.send_event(Event::Window {
+                window_id,
+                event: WindowEvent::DataTransferReceived { id, serial, value },
+            });
+            return Ok(serial);
+        }
         let (data, window_id) = match self.0.data_transfer().drag_state(id) {
             Some(state) => (state.data.clone(), state.window_id),
             None => {
@@ -556,7 +565,7 @@ impl RootActiveEventLoop for ActiveEventLoop {
 
     fn data_transfer(&self, id: DataTransferId) -> Result<Box<dyn DataTransfer>, TransferError> {
         if let Some(state) = self.0.data_transfer().drag_state(id) {
-            return Ok(Box::new(WinDataTransfer::new(state.data.clone())));
+            return Ok(Box::new(WinDataTransfer::for_drag(&state)));
         }
 
         let data = self.0.data_transfer().clipboard_data(id)?;
@@ -621,7 +630,7 @@ impl RootActiveEventLoop for ActiveEventLoop {
         }
 
         let id = crate::data_transfer::next_data_transfer_id();
-        let data_object = SourceDataObject::new(send_data);
+        let data_object = SourceDataObject::for_drag(send_data);
         let drop_source = DropSource::new();
 
         // Attach a drag preview if the app supplied one. Cosmetic failures must not abort the

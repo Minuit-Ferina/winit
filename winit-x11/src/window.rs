@@ -431,6 +431,7 @@ unsafe impl Sync for UnownedWindow {}
 
 #[derive(Debug)]
 pub struct UnownedWindow {
+    pub(crate) custom_drag_types: Vec<crate::data_transfer::SelectionType>,
     pub(crate) xconn: Arc<XConnection>, // never changes
     xwindow: xproto::Window,            // never changes
     #[allow(dead_code)]
@@ -660,6 +661,13 @@ impl UnownedWindow {
 
         #[allow(clippy::mutex_atomic)]
         let mut window = UnownedWindow {
+            custom_drag_types: window_attrs
+                .custom_drag_formats
+                .iter()
+                .filter_map(|format| {
+                    crate::data_transfer::SelectionType::from_custom_drag_format(xconn, format)
+                })
+                .collect(),
             xconn: Arc::clone(xconn),
             xwindow: xwindow as xproto::Window,
             visual,

@@ -169,16 +169,12 @@ impl RootActiveEventLoop for ActiveEventLoop {
 
         let type_ = match type_.cast_ref::<PasteboardType>() {
             Some(pb_type) => pb_type.clone(),
-            None => {
-                let hint = type_.hint().ok_or(TransferError::Failed)?;
-                pb.types()
-                    .iter()
-                    .find(|advertised| {
-                        advertised.hint().is_some_and(|haystack| haystack.matches(&hint))
-                    })
-                    .cloned()
-                    .ok_or(TransferError::Failed)?
-            },
+            None => pb
+                .types()
+                .iter()
+                .find(|advertised| type_.matches(*advertised))
+                .cloned()
+                .ok_or(TransferError::Failed)?,
         };
 
         let serial = AsyncRequestSerial::get();
@@ -228,7 +224,7 @@ impl RootActiveEventLoop for ActiveEventLoop {
         let first_uri = uris.next();
 
         let mut objects: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> =
-            vec![ProtocolObject::from_retained(PasteboardWriter::new(send_data, first_uri))];
+            vec![ProtocolObject::from_retained(PasteboardWriter::new(send_data, first_uri, false))];
 
         for uri in uris {
             let item = NSPasteboardItem::new();
@@ -334,7 +330,7 @@ impl RootActiveEventLoop for ActiveEventLoop {
 
                 let first_dragging_item = NSDraggingItem::initWithPasteboardWriter(
                     NSDraggingItem::alloc(),
-                    ProtocolObject::from_ref(&*PasteboardWriter::new(send_data, first_uri)),
+                    ProtocolObject::from_ref(&*PasteboardWriter::new(send_data, first_uri, true)),
                 );
 
                 unsafe {

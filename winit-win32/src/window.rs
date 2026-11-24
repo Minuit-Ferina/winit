@@ -1448,6 +1448,7 @@ impl InitData<'_> {
             let mut file_drop_handler = FileDropHandler::new(
                 win.window.hwnd(),
                 self.runner.clone(),
+                &self.attributes.custom_drag_formats,
                 Box::new(move |event| {
                     file_drop_runner.send_event(Event::Window { window_id, event })
                 }),

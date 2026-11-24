@@ -577,24 +577,30 @@ impl EventProcessor {
                 let version = flags >> 24;
 
                 let has_more_types = flags - (flags & (c_long::MAX - 1)) == 1;
-                let types: Vec<_> = if !has_more_types {
+                let atoms_offered = if !has_more_types {
                     [
                         xev.data.get_long(2) as xproto::Atom,
                         xev.data.get_long(3) as xproto::Atom,
                         xev.data.get_long(4) as xproto::Atom,
                     ]
-                    .map(|ty_atom| SelectionType::new(atoms, ty_atom))
-                    .into_iter()
-                    .collect()
-                } else if let Ok(more_types) = unsafe { dnd.get_type_list(source_window) } {
-                    more_types
-                        .into_iter()
-                        .map(|ty_atom| SelectionType::new(atoms, ty_atom))
-                        .collect()
+                    .to_vec()
                 } else {
-                    Default::default()
+                    unsafe { dnd.get_type_list(source_window) }.unwrap_or_default()
                 };
 
+                let custom_types = self
+                    .with_window(window, |window| window.custom_drag_types.clone())
+                    .unwrap_or_default();
+                let types: Vec<_> = atoms_offered
+                    .into_iter()
+                    .map(|atom| {
+                        custom_types
+                            .iter()
+                            .find(|ty| ty.atom() == atom)
+                            .cloned()
+                            .unwrap_or_else(|| SelectionType::new(atoms, atom))
+                    })
+                    .collect();
                 dnd.init_state(version, source_window, window, types.into()).transfer_id
             };
 

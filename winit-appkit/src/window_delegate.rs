@@ -51,7 +51,7 @@ use tracing::{debug_span, trace, warn};
 use winit_common::core_foundation::MainRunLoop;
 use winit_common::positioner::place_window;
 use winit_core::cursor::Cursor;
-use winit_core::data_transfer::DataTransferId;
+use winit_core::data_transfer::{CustomDragFormat, DataTransferId};
 use winit_core::error::{CreateWindowError, InvalidInput, NotSupportedError, RequestError};
 use winit_core::event::{SurfaceSizeWriter, WindowEvent};
 use winit_core::icon::Icon;
@@ -68,11 +68,12 @@ use super::monitor::{self, MonitorHandle, flip_window_screen_coordinates, get_di
 use super::util::cgerr;
 use super::view::WinitView;
 use super::window::{WinitPanel, WinitWindow, window_id};
-use crate::data_transfer::ns_drag_operation_to_dnd_action;
+use crate::data_transfer::{custom_drag_pasteboard_name, ns_drag_operation_to_dnd_action};
 use crate::{BlurMaterial, OptionAsAlt, WindowAttributesMacOS, WindowExtMacOS};
 
 #[derive(Debug)]
 pub(crate) struct State {
+    custom_drag_formats: Arc<[CustomDragFormat]>,
     /// Strong reference to the global application state.
     app_state: Rc<AppState>,
 
@@ -442,7 +443,12 @@ define_class!(
 
             let transfer_id = DataTransferId::from_raw(sender.draggingSequenceNumber() as i64);
             let data_transfer = vars.app_state.data_transfer();
-            data_transfer.register_drag(transfer_id, &pb, window_id);
+            data_transfer.register_drag(
+                transfer_id,
+                &pb,
+                window_id,
+                vars.custom_drag_formats.clone(),
+            );
 
             self.queue_event(WindowEvent::DragEntered {
                 id: transfer_id,
@@ -1006,26 +1012,27 @@ impl WindowDelegate {
             window_type,
             anchored,
             positioner: RefCell::new(attrs.positioner.unwrap_or_default()),
+            custom_drag_formats: attrs.custom_drag_formats.into(),
         });
         let delegate: Retained<WindowDelegate> = unsafe { msg_send![super(delegate), init] };
 
         window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
         let drag_types = unsafe {
-            // Advertize support for the set of types which correspond to variants of `TypeHint`.
-            // If the user wants to support other pasteboard types which don't have a cross-platform
-            // equivalent, they can downcast the window and manually call `registerForDraggedTypes`
-            // themselves.
-            NSArray::from_slice(&[
+            [
                 NSPasteboardTypeFileURL,
                 NSPasteboardTypeHTML,
                 NSPasteboardTypePNG,
                 NSPasteboardTypeSound,
                 NSPasteboardTypeString,
                 NSPasteboardTypeTIFF,
-            ])
+            ]
         };
-        window.registerForDraggedTypes(&drag_types);
+        let custom_drag_types: Vec<_> =
+            delegate.ivars().custom_drag_formats.iter().map(custom_drag_pasteboard_name).collect();
+        let drag_types: Vec<_> =
+            drag_types.into_iter().chain(custom_drag_types.iter().map(|name| &**name)).collect();
+        window.registerForDraggedTypes(&NSArray::from_slice(&drag_types));
 
         // Listen for theme change event.
         //

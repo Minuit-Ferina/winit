@@ -18,7 +18,8 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSArray, NSData, NSObject, NSObjectProtocol, NSString, NSURL};
 use winit_core::data_transfer::{
-    DataTransfer, DataTransferId, DataTransferSend, SendData, TransferType, TypeHint, TypedData,
+    CustomDragFormat, DataTransfer, DataTransferId, DataTransferSend, SendData, TransferType,
+    TypeHint, TypedData,
 };
 use winit_core::event_loop::DndAction;
 use winit_core::window::WindowId;
@@ -26,9 +27,16 @@ use winit_core::window::WindowId;
 /// A thin wrapper around [`NSPasteboardType`], implementing [`TransferType`].
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub struct PasteboardType {
+    custom: Option<CustomDragFormat>,
     hint: Option<TypeHint>,
     // We need to convert `NSString` to `str` since `NSString` isn't `Send`/`Sync`
     inner: Arc<str>,
+}
+
+const CUSTOM_DRAG_PREFIX: &str = "org.rust-windowing.winit.drag.";
+
+pub(crate) fn custom_drag_pasteboard_name(format: &CustomDragFormat) -> Retained<NSString> {
+    NSString::from_str(&format!("{CUSTOM_DRAG_PREFIX}{}", format.name()))
 }
 
 impl PasteboardType {
@@ -45,8 +53,11 @@ impl PasteboardType {
         };
 
         hint_to_pasteboard_type.into_iter().find_map(|(haystack, inner)| {
-            (haystack.matches(&hint))
-                .then(|| Self { hint: Some(hint), inner: inner.to_string().into() })
+            (haystack.matches(&hint)).then(|| Self {
+                custom: None,
+                hint: Some(hint),
+                inner: inner.to_string().into(),
+            })
         })
     }
 }
@@ -72,7 +83,10 @@ impl From<Retained<NSPasteboardType>> for PasteboardType {
             .iter()
             .find_map(|(pb_type, hint)| (**pb_type == *value).then_some(hint));
 
-        Self { hint: hint.copied(), inner: value.to_string().into() }
+        let name = value.to_string();
+        let custom =
+            name.strip_prefix(CUSTOM_DRAG_PREFIX).and_then(|name| CustomDragFormat::new(name).ok());
+        Self { custom, hint: hint.copied(), inner: name.into() }
     }
 }
 
@@ -81,7 +95,14 @@ impl TransferType for PasteboardType {
         self.hint
     }
 
+    fn custom_drag_format(&self) -> Option<&CustomDragFormat> {
+        self.custom.as_ref()
+    }
+
     fn matches(&self, other: &dyn TransferType) -> bool {
+        if let Some(custom) = &self.custom {
+            return custom.matches(other);
+        }
         if let Some(other_pb_type) = other.cast_ref::<Self>() {
             *self == *other_pb_type
         } else {
@@ -98,6 +119,7 @@ pub struct Pasteboard {
     ns_pasteboard: MainThreadBound<Retained<NSPasteboard>>,
     change_count: isize,
     types: OnceLock<Arc<[PasteboardType]>>,
+    custom_drag_formats: Arc<[CustomDragFormat]>,
 }
 
 impl Clone for Pasteboard {
@@ -111,6 +133,7 @@ impl Clone for Pasteboard {
             ns_pasteboard: inner,
             change_count: self.change_count,
             types: self.types.clone(),
+            custom_drag_formats: self.custom_drag_formats.clone(),
         }
     }
 }
@@ -127,6 +150,7 @@ impl Pasteboard {
             ns_pasteboard: MainThreadBound::new(ns_pasteboard, mtm),
             change_count,
             types: Default::default(),
+            custom_drag_formats: Arc::default(),
         }
     }
 
@@ -152,7 +176,16 @@ impl Pasteboard {
         self.types.get_or_init(|| {
             self.try_access(|pb| {
                 pb.types()
-                    .map(|types| types.into_iter().map(PasteboardType::from).collect::<Vec<_>>())
+                    .map(|types| {
+                        types
+                            .into_iter()
+                            .map(PasteboardType::from)
+                            .filter(|ty| {
+                                ty.custom_drag_format()
+                                    .is_none_or(|format| self.custom_drag_formats.contains(format))
+                            })
+                            .collect::<Vec<_>>()
+                    })
                     .unwrap_or_default()
             })
             .unwrap_or_default()
@@ -192,7 +225,15 @@ impl PasteboardTypeSpec {
     pub(crate) fn from_dyn(type_: &dyn TransferType) -> Option<Self> {
         match type_.cast_ref::<PasteboardType>() {
             Some(pb_type) => Some(Self::PasteboardType(pb_type.clone())),
-            None => type_.hint().map(Into::into),
+            None => {
+                if let Some(custom) = type_.custom_drag_format() {
+                    Some(Self::PasteboardType(PasteboardType::from(custom_drag_pasteboard_name(
+                        custom,
+                    ))))
+                } else {
+                    type_.hint().map(Into::into)
+                }
+            },
         }
     }
 }
@@ -357,6 +398,7 @@ impl TypedData for PasteboardValue {
 #[derive(Debug)]
 struct ActivePasteboard {
     window_id: WindowId,
+    custom_drag_formats: Arc<[CustomDragFormat]>,
     pb: MainThreadBound<Weak<NSPasteboard>>,
 }
 
@@ -391,22 +433,28 @@ impl Pasteboards {
         transfer_id: DataTransferId,
         pb: &MainThreadBound<Retained<NSPasteboard>>,
         window_id: WindowId,
+        custom_drag_formats: Arc<[CustomDragFormat]>,
     ) {
         let mut inner = self.inner.borrow_mut();
         let transfer = inner.entry(transfer_id).or_insert_with(move || {
             pb.get_on_main(move |pb| ActivePasteboard {
                 window_id,
+                custom_drag_formats: Arc::default(),
                 pb: MainThreadBound::new(Weak::from_retained(pb), MainThreadMarker::new().unwrap()),
             })
         });
 
         transfer.window_id = window_id;
+        transfer.custom_drag_formats = custom_drag_formats;
     }
 
     pub fn get(&self, id: DataTransferId) -> Option<Pasteboard> {
-        self.inner.borrow().get(&id).and_then(|ActivePasteboard { pb, .. }| {
-            pb.get_on_main(|state| {
-                Some(Pasteboard::new(id, state.load()?, MainThreadMarker::new().unwrap()))
+        self.inner.borrow().get(&id).and_then(|active| {
+            active.pb.get_on_main(|state| {
+                let mut pasteboard =
+                    Pasteboard::new(id, state.load()?, MainThreadMarker::new().unwrap());
+                pasteboard.custom_drag_formats = active.custom_drag_formats.clone();
+                Some(pasteboard)
             })
         })
     }
@@ -440,8 +488,9 @@ impl DataTransferState {
         id: DataTransferId,
         pb: &MainThreadBound<Retained<NSPasteboard>>,
         window_id: WindowId,
+        custom_drag_formats: Arc<[CustomDragFormat]>,
     ) {
-        self.pasteboards.insert(id, pb, window_id);
+        self.pasteboards.insert(id, pb, window_id, custom_drag_formats);
         self.drag.replace(Some(DragState { id, valid_actions: vec![] }));
     }
 
@@ -514,9 +563,13 @@ impl PasteboardWriter {
     pub(crate) fn new(
         value: Box<dyn DataTransferSend>,
         uri: Option<Retained<NSString>>,
+        is_drag: bool,
     ) -> Retained<Self> {
         let mut writable_types = Vec::<Retained<NSPasteboardType>>::new();
         value.for_each_available_type(&mut |type_| {
+            if !is_drag && type_.custom_drag_format().is_some() {
+                return ControlFlow::Continue(());
+            }
             let Some(spec) = PasteboardTypeSpec::from_dyn(type_) else {
                 return ControlFlow::Continue(());
             };

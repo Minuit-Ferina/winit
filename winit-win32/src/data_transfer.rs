@@ -30,7 +30,7 @@ use windows_sys::Win32::System::DataExchange::{
     GetClipboardSequenceNumber, RegisterClipboardFormatW,
 };
 use windows_sys::Win32::System::Memory::{
-    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+    GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 use windows_sys::Win32::System::Ole::{
     CF_HDROP, CF_UNICODETEXT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE,
@@ -42,7 +42,8 @@ use windows_sys::Win32::System::SystemServices::{
 use windows_sys::Win32::UI::Shell::{DROPFILES, DragQueryFileW, HDROP};
 use windows_sys::core::{BOOL, GUID, HRESULT, IID_IUnknown};
 use winit_core::data_transfer::{
-    DataTransfer, DataTransferId, DataTransferSend, SendData, TransferType, TypeHint, TypedData,
+    CustomDragFormat, DataTransfer, DataTransferId, DataTransferSend, SendData, TransferType,
+    TypeHint, TypedData,
 };
 use winit_core::error::TransferError;
 use winit_core::event::WindowEvent;
@@ -101,13 +102,7 @@ impl StgMedium {
     /// Returns `Ok(None)` if the object doesn't provide the format, and `Err` if the clipboard
     /// could not be opened.
     unsafe fn get(data_obj: *const IDataObject, cf_format: u16) -> Result<Option<Self>, HRESULT> {
-        let format = FORMATETC {
-            cfFormat: cf_format,
-            ptd: std::ptr::null_mut(),
-            dwAspect: DVASPECT_CONTENT,
-            lindex: -1,
-            tymed: TYMED_HGLOBAL as u32,
-        };
+        let format = hglobal_format(cf_format);
 
         let mut medium = unsafe { std::mem::zeroed::<STGMEDIUM>() };
         let get_data = unsafe { (*(*data_obj).cast::<IDataObjectVtbl>()).GetData };
@@ -303,14 +298,132 @@ unsafe fn read_png(data_obj: *const IDataObject) -> Result<Option<Vec<u8>>, HRES
     Ok(Some(bytes))
 }
 
+fn hglobal_format(cf_format: u16) -> FORMATETC {
+    FORMATETC {
+        cfFormat: cf_format,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL as u32,
+    }
+}
+
+const CUSTOM_DRAG_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+fn custom_drag_format_id(format: &CustomDragFormat) -> Option<u16> {
+    register_clipboard_format(&format!("winit.drag.v1.{}", format.name()))
+}
+
+fn encode_custom_drag_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() > CUSTOM_DRAG_MAX_BYTES {
+        return None;
+    }
+    let mut encoded = Vec::with_capacity(4 + bytes.len());
+    encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    encoded.extend_from_slice(bytes);
+    Some(encoded)
+}
+
+fn custom_drag_len(header: [u8; 4], capacity: usize) -> Option<usize> {
+    let len = u32::from_le_bytes(header) as usize;
+    (len <= CUSTOM_DRAG_MAX_BYTES && len <= capacity).then_some(len)
+}
+
+/// A retained incoming IDataObject. Access is confined to the OLE event-loop thread.
+#[derive(Debug)]
+struct IncomingDataObject(*mut IDataObject);
+
+impl IncomingDataObject {
+    unsafe fn retain(data: *const IDataObject) -> Self {
+        let object = Self(data.cast_mut());
+        // SAFETY: IDataObject has the IUnknown vtable prefix. OLE lends a live object.
+        unsafe { (object.vtable().parent.AddRef)(object.0.cast()) };
+        object
+    }
+
+    fn vtable(&self) -> &IDataObjectVtbl {
+        // SAFETY: The interface pointer is valid until we release our reference.
+        unsafe { &*(*self.0).cast::<IDataObjectVtbl>() }
+    }
+
+    fn has_format(&self, format: u16) -> bool {
+        // SAFETY: The reference keeps the object alive on its owning apartment.
+        unsafe { (self.vtable().QueryGetData)(self.0, &hglobal_format(format)) == S_OK }
+    }
+
+    fn read_bytes(&self, format: u16) -> Option<Vec<u8>> {
+        // SAFETY: The reference keeps the object alive on its owning apartment.
+        let medium = unsafe { StgMedium::get(self.0, format) }.ok()??;
+        if medium.0.tymed != TYMED_HGLOBAL as u32 {
+            return None;
+        }
+        let hglobal = medium.hglobal();
+        if hglobal.is_null() {
+            return None;
+        }
+        // SAFETY: The medium owns this HGLOBAL through the entire lock and read.
+        let capacity = unsafe { GlobalSize(hglobal) }.checked_sub(4)?;
+        let ptr = unsafe { GlobalLock(hglobal) }.cast::<u8>();
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: The first four bytes are the length of the v1 payload. Check
+        // that length before reading or forming a slice from the native block.
+        let header = unsafe { ptr.cast::<[u8; 4]>().read() };
+        let result = custom_drag_len(header, capacity)
+            .map(|len| unsafe { std::slice::from_raw_parts(ptr.add(4), len) }.to_vec());
+        unsafe { GlobalUnlock(hglobal) };
+        result
+    }
+}
+
+impl Drop for IncomingDataObject {
+    fn drop(&mut self) {
+        // SAFETY: This matches the AddRef in retain, on the same apartment.
+        unsafe { (self.vtable().parent.Release)(self.0.cast()) };
+    }
+}
+
+#[derive(Debug)]
+struct CustomDragBytes {
+    format: CustomDragFormat,
+    bytes: Vec<u8>,
+}
+
+impl TypedData for CustomDragBytes {
+    fn type_(&self) -> &dyn TransferType {
+        &self.format
+    }
+
+    fn try_read(&self) -> Option<Box<dyn io::BufRead>> {
+        Some(Box::new(io::Cursor::new(self.bytes.clone())))
+    }
+
+    fn try_as_uris(&self) -> io::Result<Vec<String>> {
+        Err(io::ErrorKind::InvalidData.into())
+    }
+
+    fn try_as_string(&self) -> io::Result<String> {
+        Err(io::ErrorKind::InvalidData.into())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct WinDataTransfer {
     data: Arc<DataObject>,
+    custom_formats: Vec<CustomDragFormat>,
 }
 
 impl WinDataTransfer {
     pub(crate) fn new(data: Arc<DataObject>) -> Self {
-        Self { data }
+        Self { data, custom_formats: Vec::new() }
+    }
+
+    pub(crate) fn for_drag(state: &DragState) -> Self {
+        Self {
+            data: state.data.clone(),
+            custom_formats: state.custom_formats.iter().map(|(_, format)| format.clone()).collect(),
+        }
     }
 }
 
@@ -319,11 +432,13 @@ impl DataTransfer for WinDataTransfer {
         &'this self,
         func: &'_ mut dyn FnMut(&'this dyn TransferType) -> ControlFlow<()>,
     ) {
-        for hint in self.data.data.keys() {
-            if let ControlFlow::Break(()) = func(hint) {
-                break;
-            }
-        }
+        let formats = self
+            .data
+            .data
+            .keys()
+            .map(|hint| hint as &dyn TransferType)
+            .chain(self.custom_formats.iter().map(|format| format as &dyn TransferType));
+        let _ = formats.into_iter().try_for_each(func);
     }
 }
 
@@ -380,6 +495,7 @@ pub struct FileDropHandlerData {
     runner: Rc<EventLoopRunner>,
     send_event: Box<dyn Fn(WindowEvent)>,
     active_data_transfer_id: Option<DataTransferId>,
+    custom_formats: Vec<(u16, CustomDragFormat)>,
     // Shell drop-target helper. Lazy-init on first DragEnter; `None` means "not yet created" or
     // "creation failed and we're running without a drag image". Forwarding to this is what
     // makes the source's `IDragSourceHelper` bitmap actually render under the cursor over our
@@ -396,6 +512,7 @@ impl FileDropHandler {
     pub(crate) fn new(
         window: HWND,
         runner: Rc<EventLoopRunner>,
+        custom_formats: &[CustomDragFormat],
         send_event: Box<dyn Fn(WindowEvent)>,
     ) -> FileDropHandler {
         let data = Box::new(FileDropHandlerData {
@@ -405,6 +522,10 @@ impl FileDropHandler {
             runner,
             send_event,
             active_data_transfer_id: None,
+            custom_formats: custom_formats
+                .iter()
+                .filter_map(|format| Some((custom_drag_format_id(format)?, format.clone())))
+                .collect(),
             drop_target_helper: None,
         });
         FileDropHandler { data: Box::into_raw(data) }
@@ -516,7 +637,29 @@ impl FileDropHandler {
         let wid = WindowId::from_raw(drop_handler.window.addr());
 
         let data = Arc::new(unsafe { DataObject::from_idataobject(pDataObj) }.unwrap_or_default());
-        drop_handler.runner.data_transfer().register_drag(data_transfer_id, wid, data);
+        let (custom_formats, object) =
+            if drop_handler.custom_formats.is_empty() || pDataObj.is_null() {
+                (Vec::new(), None)
+            } else {
+                // SAFETY: DragEnter supplies the IDataObject used for the drag.
+                let object = Rc::new(unsafe { IncomingDataObject::retain(pDataObj) });
+                let formats: Vec<_> = drop_handler
+                    .custom_formats
+                    .iter()
+                    .filter(|(native, _)| object.has_format(*native))
+                    .cloned()
+                    .collect();
+                let object = (!formats.is_empty()).then_some(object);
+                (formats, object)
+            };
+        drop_handler.runner.data_transfer().register_drag(DragState {
+            id: data_transfer_id,
+            window_id: wid,
+            data,
+            actions: Vec::new(),
+            custom_formats,
+            object,
+        });
 
         let pt_screen = POINT { x: pt.x, y: pt.y };
         let mut pt_client = pt_screen;
@@ -660,13 +803,7 @@ impl FileDropHandler {
             proposed_action,
         });
 
-        // New scope to make sure that the `Ref` returned by `current_drag_actions` is dropped
-        // before we call `remove_drag`.
         {
-            // Get actions after the event handler has run, so that we update it based on the user's
-            // supplied info.
-            let actions =
-                drop_handler.runner.data_transfer().current_drag_actions(data_transfer_id);
             let source_allowed = unsafe { pdwEffect.read() };
             let proposed_action =
                 drop_handler.runner.data_transfer().proposed_dnd_action(data_transfer_id, effects);
@@ -676,7 +813,12 @@ impl FileDropHandler {
             // `DROPEFFECT_NONE`; in that case OLE reports back `effect_out == DROPEFFECT_NONE` to
             // the source, so the matching observer-facing event is `DragLeft`, not `DragDropped` -
             // otherwise target and source see contradictory outcomes.
-            let effect = pick_effect(&actions, grfKeyState, source_allowed);
+            // The event handler can fetch from OLE, so release the state borrow first.
+            let effect = {
+                let actions =
+                    drop_handler.runner.data_transfer().current_drag_actions(data_transfer_id);
+                pick_effect(&actions, grfKeyState, source_allowed)
+            };
             let event = if effect == DROPEFFECT_NONE {
                 WindowEvent::DragLeft { id: data_transfer_id }
             } else {
@@ -876,6 +1018,8 @@ pub(crate) struct DragState {
     pub(crate) window_id: WindowId,
     pub(crate) data: Arc<DataObject>,
     pub(crate) actions: Vec<DndAction>,
+    custom_formats: Vec<(u16, CustomDragFormat)>,
+    object: Option<Rc<IncomingDataObject>>,
 }
 
 #[derive(Debug)]
@@ -900,21 +1044,39 @@ pub(crate) struct DataTransferState {
 }
 
 impl DataTransferState {
-    pub(crate) fn register_drag(
+    fn register_drag(&self, state: DragState) {
+        self.drag.replace(Some(state));
+    }
+
+    pub(crate) fn read_custom_drag(
         &self,
         id: DataTransferId,
-        window_id: WindowId,
-        data: Arc<DataObject>,
-    ) {
-        *self.drag.borrow_mut() =
-            Some(DragState { id, window_id, data, actions: Default::default() });
+        format: &CustomDragFormat,
+    ) -> Result<(WindowId, Arc<dyn TypedData>), TransferError> {
+        let (window_id, native, object) = {
+            let state = self.drag_state(id).ok_or(TransferError::UnknownTransfer(id))?;
+            let (native, _) = state
+                .custom_formats
+                .iter()
+                .find(|(_, advertised)| advertised == format)
+                .ok_or(TransferError::Failed)?;
+            let object = state.object.as_ref().ok_or(TransferError::Failed)?.clone();
+            (state.window_id, *native, object)
+        };
+        // COM can reenter the event loop. The session is unborrowed during GetData.
+        let bytes = object.read_bytes(native).ok_or(TransferError::Failed)?;
+        let state = self.drag_state(id).ok_or(TransferError::UnknownTransfer(id))?;
+        if state.window_id != window_id
+            || !state.object.as_ref().is_some_and(|active| Rc::ptr_eq(active, &object))
+        {
+            return Err(TransferError::UnknownTransfer(id));
+        }
+        Ok((window_id, Arc::new(CustomDragBytes { format: format.clone(), bytes })))
     }
 
     pub(crate) fn remove_drag(&self, id: DataTransferId) {
-        let mut state = self.drag.borrow_mut();
-        if state.as_ref().is_some_and(|s| s.id == id) {
-            *state = None;
-        }
+        let old = self.drag.borrow_mut().take_if(|state| state.id == id);
+        drop(old);
     }
 
     pub(crate) fn drag_state(&self, id: DataTransferId) -> Option<Ref<'_, DragState>> {
@@ -1120,7 +1282,7 @@ unsafe fn duplicate_stgmedium(src: &STGMEDIUM, cf_format: u16) -> Option<STGMEDI
 }
 
 fn alloc_hglobal_from(src: &[u8]) -> Option<HGLOBAL> {
-    let hglobal = unsafe { GlobalAlloc(GMEM_MOVEABLE, src.len()) };
+    let hglobal = unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, src.len()) };
     if hglobal.is_null() {
         return None;
     }
@@ -1188,9 +1350,9 @@ fn build_html_clipboard_format(html: &str) -> Vec<u8> {
 ///
 /// Callers must have already validated that the `SendData` variant matches the on-the-wire shape
 /// the requested clipboard format expects (see `variant_matches_hint` at the `GetData` call site).
-unsafe fn send_data_to_stgmedium(data: SendData, hint: TypeHint) -> Option<STGMEDIUM> {
+unsafe fn send_data_to_stgmedium(data: SendData, hint: Option<TypeHint>) -> Option<STGMEDIUM> {
     let hglobal = match data {
-        SendData::String(s) if matches!(hint, TypeHint::Html) => {
+        SendData::String(s) if hint == Some(TypeHint::Html) => {
             // HTML Clipboard Format: UTF-8 with a Version/StartHTML/EndHTML/StartFragment/
             // EndFragment header. Targets parse the header before reading the wrapped HTML.
             let bytes = build_html_clipboard_format(&s);
@@ -1440,24 +1602,39 @@ struct SourceDataObjectData {
     refcount: AtomicUsize,
     send_data: RefCell<Box<dyn DataTransferSend>>,
     // (cf_format, hint) pairs we advertise to the target.
-    formats: Vec<(u16, TypeHint)>,
+    formats: Vec<(u16, SourceFormat)>,
     // Formats injected via `SetData` - primarily by `IDragSourceHelper::InitializeFromBitmap`,
     // which stores the drag image bits (CFSTR_DRAGIMAGEBITS) and related shell formats here so
     // the target-side `IDropTargetHelper` can read them back via `GetData`.
     extras: RefCell<Vec<(FORMATETC, OwnedStgMedium)>>,
 }
 
+enum SourceFormat {
+    Standard(TypeHint),
+    Custom(CustomDragFormat),
+}
+
 com_iunknown_impl!(SourceDataObjectData, &IID_IDataObject);
 
 #[allow(non_snake_case)]
 impl SourceDataObjectData {
-    fn new_boxed(send_data: Box<dyn DataTransferSend>) -> *mut Self {
-        let mut formats: Vec<(u16, TypeHint)> = Vec::new();
+    fn new_boxed(send_data: Box<dyn DataTransferSend>, is_drag: bool) -> *mut Self {
+        let mut formats = Vec::new();
         send_data.for_each_available_type(&mut |ty| {
+            if is_drag {
+                if let Some(format) = ty.custom_drag_format() {
+                    if let Some(cf) = custom_drag_format_id(format) {
+                        if !formats.iter().any(|(id, _)| *id == cf) {
+                            formats.push((cf, SourceFormat::Custom(format.clone())));
+                        }
+                    }
+                    return ControlFlow::Continue(());
+                }
+            }
             if let Some(hint) = ty.hint() {
                 for (cf, specialised) in cf_formats_for_hint(hint) {
                     if !formats.iter().any(|(c, _)| *c == cf) {
-                        formats.push((cf, specialised));
+                        formats.push((cf, SourceFormat::Standard(specialised)));
                     }
                 }
             }
@@ -1500,7 +1677,8 @@ impl SourceDataObjectData {
                 }
             }
         }
-        let Some(&(_, hint)) = me.formats.iter().find(|&&(cf, _)| cf == format.cfFormat) else {
+        let Some((_, source_format)) = me.formats.iter().find(|(cf, _)| *cf == format.cfFormat)
+        else {
             return DV_E_FORMATETC;
         };
         // `try_borrow_mut` rather than `borrow_mut`: `data_for_type` is the app's callback and
@@ -1510,14 +1688,22 @@ impl SourceDataObjectData {
             let Ok(send_data) = me.send_data.try_borrow_mut() else {
                 return E_UNEXPECTED;
             };
-            send_data.data_for_type(&hint)
+            let ty: &dyn TransferType = match source_format {
+                SourceFormat::Standard(hint) => hint,
+                SourceFormat::Custom(format) => format,
+            };
+            send_data.data_for_type(ty)
         };
-        let Some(data) = data else {
-            return DV_E_FORMATETC;
+        let (data, hint) = match (source_format, data) {
+            (SourceFormat::Standard(hint), Some(data)) if variant_matches_hint(*hint, &data) => {
+                (data, Some(*hint))
+            },
+            (SourceFormat::Custom(_), Some(SendData::Bytes(bytes))) => {
+                let Some(encoded) = encode_custom_drag_bytes(&bytes) else { return DV_E_FORMATETC };
+                (SendData::Bytes(encoded), None)
+            },
+            _ => return DV_E_FORMATETC,
         };
-        if !variant_matches_hint(hint, &data) {
-            return DV_E_FORMATETC;
-        }
         let Some(medium) = (unsafe { send_data_to_stgmedium(data, hint) }) else {
             return E_FAIL;
         };
@@ -1683,7 +1869,11 @@ pub(crate) struct SourceDataObject {
 
 impl SourceDataObject {
     pub(crate) fn new(send_data: Box<dyn DataTransferSend>) -> Self {
-        Self { data: SourceDataObjectData::new_boxed(send_data) }
+        Self { data: SourceDataObjectData::new_boxed(send_data, false) }
+    }
+
+    pub(crate) fn for_drag(send_data: Box<dyn DataTransferSend>) -> Self {
+        Self { data: SourceDataObjectData::new_boxed(send_data, true) }
     }
 
     pub(crate) fn interface_ptr(&self) -> *mut c_void {
@@ -1962,5 +2152,50 @@ mod tests {
         let end_fragment = parse_offset(&buf, "EndFragment");
         let fragment = std::str::from_utf8(&buf[start_fragment..end_fragment]).unwrap();
         assert_eq!(fragment, "<p>hi</p>");
+    }
+}
+
+#[cfg(test)]
+mod custom_drag_tests {
+    use winit_core::data_transfer::DataTransferSendBuilder;
+
+    use super::*;
+
+    #[test]
+    fn custom_ole_offer_checks_metadata_before_asking_for_data() {
+        let format = CustomDragFormat::new("org.example.custom-drag-test").unwrap();
+        let native = custom_drag_format_id(&format).unwrap();
+        let unknown =
+            custom_drag_format_id(&CustomDragFormat::new("org.example.unknown-drag-test").unwrap())
+                .unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let bytes = vec![9, 0, 1, 0, 0];
+        let offer = DataTransferSendBuilder::new((reads.clone(), bytes.clone()))
+            .with_type(format, |(reads, bytes), _| {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Some(bytes.clone())
+            })
+            .build();
+        let source = SourceDataObject::for_drag(offer);
+        // SAFETY: SourceDataObject owns a live IDataObject on this thread.
+        let incoming = unsafe { IncomingDataObject::retain(source.interface_ptr().cast()) };
+        drop(source);
+
+        assert!(incoming.has_format(native));
+        assert!(!incoming.has_format(unknown));
+        assert!(!incoming.has_format(CF_UNICODETEXT));
+        assert!(incoming.read_bytes(CF_UNICODETEXT).is_none());
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert_eq!(incoming.read_bytes(native), Some(bytes));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn custom_ole_lengths_preserve_empty_data_and_reject_invalid_lengths() {
+        assert_eq!(encode_custom_drag_bytes(&[]).unwrap(), [0; 4]);
+        assert_eq!(custom_drag_len([0; 4], 0), Some(0));
+        assert_eq!(custom_drag_len(3u32.to_le_bytes(), 8), Some(3));
+        assert_eq!(custom_drag_len(3u32.to_le_bytes(), 2), None);
+        assert_eq!(custom_drag_len(u32::MAX.to_le_bytes(), usize::MAX), None);
     }
 }

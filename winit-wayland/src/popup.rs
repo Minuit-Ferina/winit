@@ -157,6 +157,7 @@ impl Popup {
             scale_factor,
             Some(parent_window_id),
         );
+        popup_state.custom_drag_formats = attributes.custom_drag_formats;
 
         // Set transparency hint.
         popup_state.set_transparent(attributes.transparent);

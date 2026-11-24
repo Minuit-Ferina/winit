@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use winit_core::data_transfer::{
-    DataTransfer, DataTransferId, DataTransferSend, SendData, TransferType, TypeHint, TypedData,
+    CustomDragFormat, DataTransfer, DataTransferId, DataTransferSend, SendData, TransferType,
+    TypeHint, TypedData,
 };
 use winit_core::error::TransferError;
 use winit_core::event::WindowEvent;
@@ -340,6 +341,7 @@ impl FinishedDataTransfer {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SelectionType {
+    custom: Option<CustomDragFormat>,
     hint: Option<TypeHint>,
     atom: xproto::Atom,
 }
@@ -389,7 +391,7 @@ impl SelectionType {
         let hint =
             Self::atom_hints(atoms).find_map(|(haystack, hint)| (haystack == atom).then_some(hint));
 
-        Self { hint, atom }
+        Self { custom: None, hint, atom }
     }
 
     pub(crate) fn from_dyn(atoms: &Atoms, type_: &dyn TransferType) -> impl Iterator<Item = Self> {
@@ -401,12 +403,22 @@ impl SelectionType {
             .then_some(
                 Self::atom_hints(atoms)
                     .filter(|(_, haystack)| TransferType::matches(haystack, type_))
-                    .map(|(atom, hint)| Self { atom, hint: Some(hint) }),
+                    .map(|(atom, hint)| Self { custom: None, atom, hint: Some(hint) }),
             )
             .into_iter()
             .flatten();
 
         downcast.into_iter().chain(from_hint)
+    }
+
+    pub(crate) fn from_custom_drag_format(
+        xconn: &XConnection,
+        format: &CustomDragFormat,
+    ) -> Option<Self> {
+        let mime = format.drag_mime_type();
+        let atom =
+            xconn.xcb_connection().intern_atom(false, mime.as_bytes()).ok()?.reply().ok()?.atom;
+        Some(Self { custom: Some(format.clone()), atom, hint: None })
     }
 
     pub fn atom(&self) -> xproto::Atom {
@@ -419,7 +431,14 @@ impl TransferType for SelectionType {
         self.hint
     }
 
+    fn custom_drag_format(&self) -> Option<&CustomDragFormat> {
+        self.custom.as_ref()
+    }
+
     fn matches(&self, other: &dyn TransferType) -> bool {
+        if let Some(custom) = &self.custom {
+            return custom.matches(other);
+        }
         if let Some(other_mime) = other.cast_ref::<Self>() {
             *self == *other_mime
         } else {
@@ -950,7 +969,14 @@ impl DataTransferState {
     ) -> Result<AsyncRequestSerial, TransferError> {
         let type_ = type_
             .cast_ref::<SelectionType>()
-            .or_else(|| self.find_type_by_hint(type_.hint()?))
+            .filter(|selection| selection.custom.is_none())
+            .or_else(|| {
+                if let Some(custom) = type_.custom_drag_format() {
+                    self.state.as_ref()?.types.iter().find(|ty| custom.matches(*ty))
+                } else {
+                    self.find_type_by_hint(type_.hint()?)
+                }
+            })
             .cloned()
             .ok_or(TransferError::Failed)?;
 

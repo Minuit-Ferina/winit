@@ -40,7 +40,7 @@ use wayland_client::protocol::wl_shm::Format;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Proxy, QueueHandle};
 use winit_core::data_transfer::{
-    DataTransfer, DataTransferId, DataTransferSend, SendData, TransferType, TypeHint, TypedData,
+    CustomDragFormat, DataTransfer, DataTransferId, DataTransferSend, SendData, TransferType, TypeHint, TypedData,
 };
 use winit_core::error::{NotSupportedError, TransferError};
 use winit_core::event::WindowEvent;
@@ -63,6 +63,7 @@ enum Charset {
 /// MIME type as string, with an optional hint detected from the MIME type.
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub struct MimeType {
+    custom: Option<CustomDragFormat>,
     mime: Arc<str>,
     hint: Option<TypeHint>,
 }
@@ -161,6 +162,7 @@ impl MimeType {
                     .iter()
                     .filter(move |(_, haystack)| TransferType::matches(haystack, type_))
                     .map(move |(mime, _)| Self {
+                        custom: None,
                         mime: mime.to_string().into(),
                         hint: type_.hint(),
                     }),
@@ -184,7 +186,7 @@ impl MimeType {
     fn parse(value: String) -> Self {
         #[cfg(feature = "portal")]
         if value == "application/vnd.portal.filetransfer" {
-            return Self { mime: value.into(), hint: Some(TypeHint::UriList) };
+            return Self { custom: None, mime: value.into(), hint: Some(TypeHint::UriList) };
         }
         let parsed = value.parse::<mime::Mime>().ok();
         let hint = parsed.as_ref().and_then(|parsed| {
@@ -206,7 +208,8 @@ impl MimeType {
                     }
                 })
         });
-        Self { mime: value.into(), hint }
+        let custom = CustomDragFormat::from_drag_mime_type(&value);
+        Self { custom, mime: value.into(), hint }
     }
 }
 
@@ -234,7 +237,7 @@ impl TryFrom<TypeHint> for MimeType {
             .find_map(|(mime, haystack)| (*haystack == hint).then_some(*mime))
             .ok_or(UnknownTypeHint(hint))?;
 
-        Ok(Self { mime: mime.to_owned().into(), hint: Some(hint) })
+        Ok(Self { custom: None, mime: mime.to_owned().into(), hint: Some(hint) })
     }
 }
 
@@ -243,7 +246,14 @@ impl TransferType for MimeType {
         self.hint
     }
 
+    fn custom_drag_format(&self) -> Option<&CustomDragFormat> {
+        self.custom.as_ref()
+    }
+
     fn matches(&self, other: &dyn TransferType) -> bool {
+        if let Some(custom) = &self.custom {
+            return custom.matches(other);
+        }
         if let Some(other_mime) = other.cast_ref::<Self>() {
             *self == *other_mime
         } else {
@@ -335,11 +345,23 @@ impl DataOffer {
         self.transfer_id
     }
 
+    fn retain_custom_drag_formats(&mut self, formats: &[CustomDragFormat]) {
+        let allowed = |mime: &&MimeType| {
+            mime.custom_drag_format().is_none_or(|format| formats.contains(format))
+        };
+        if !self.mime_types.iter().all(|mime| allowed(&mime)) {
+            self.mime_types = self.mime_types.iter().filter(allowed).cloned().collect();
+        }
+    }
+
     fn first_mime_type(&self) -> Option<&MimeType> {
         self.mime_types.first()
     }
 
     fn find_type_dyn<'a>(&'a self, type_: &'a dyn TransferType) -> Option<&'a MimeType> {
+        if let Some(custom) = type_.custom_drag_format() {
+            return self.mime_types.iter().find(|mime| custom.matches(*mime));
+        }
         match type_.cast_ref::<MimeType>() {
             Some(mime_type) => Some(mime_type),
             None => {
@@ -1168,7 +1190,11 @@ impl WinitState {
             .map(dnd_action_winit_to_wl)
             .fold(WlDndAction::empty(), BitOr::bitor);
 
-        let mime_types = send_data.available_types().into_iter().flat_map(MimeType::from_dyn);
+        let mime_types = send_data.available_types().into_iter().flat_map(|ty| {
+            let custom =
+                ty.custom_drag_format().map(|format| MimeType::parse(format.drag_mime_type()));
+            custom.into_iter().chain(MimeType::from_dyn(ty))
+        });
 
         let data_device_manager = self
             .data_device_manager_state
@@ -1343,9 +1369,15 @@ impl DataDeviceHandler for WinitState {
         let device = data_device.id();
         let window_id = crate::make_wid(wl_surface);
 
-        let view = drag.with_mime_types(|types| {
+        let mut view = drag.with_mime_types(|types| {
             DataOffer::new(types, make_data_transfer_id(device.clone(), drag.serial))
         });
+        let window = self.windows.borrow().get(&window_id).cloned();
+        let window = window.as_ref().map(|window| window.lock().unwrap());
+        let custom_formats =
+            window.as_ref().map(|window| &window.custom_drag_formats[..]).unwrap_or_default();
+        view.retain_custom_drag_formats(custom_formats);
+        drop(window);
         let offer = OfferHandle { data: drag.inner().clone(), serial: drag.serial };
 
         let id = view.transfer_id();
@@ -1554,6 +1586,21 @@ impl PrimarySelectionSourceHandler for WinitState {
 #[cfg(test)]
 mod mime_tests {
     use super::*;
+    #[test]
+    fn mixed_offer_preserves_the_standard_format_and_matches_custom_formats_by_name() {
+        let format = CustomDragFormat::new("org.example.notes").unwrap();
+        let mime = format.drag_mime_type();
+        let id = DataTransferId::from_raw(1);
+        let mut offer = DataOffer::new(&[mime.clone(), TEXT_PLAIN.to_owned()], id);
+        offer.retain_custom_drag_formats(std::slice::from_ref(&format));
+        assert!(offer.has_type(&format));
+        assert_eq!(offer.find_type_dyn(&format).unwrap().to_string(), mime);
+        assert!(offer.has_type(&TypeHint::Plaintext));
+        offer.retain_custom_drag_formats(&[]);
+        assert!(!offer.has_type(&format));
+        assert_eq!(offer.first_mime_type().unwrap().to_string(), TEXT_PLAIN);
+    }
+
     #[test]
     fn utf8_text_parameters_are_not_whitespace_sensitive() {
         for name in [
