@@ -665,9 +665,18 @@ impl EventLoop {
     fn drain_events<A: ApplicationHandler>(&mut self, app: &mut A) {
         let mut xev = MaybeUninit::uninit();
 
+        // Hit testing needs X server replies. Collapse queued mouse motion
+        // before testing, and flush periodically if the X queue stays busy.
+        let mut events_in_batch = 0;
         while let Some(xev) = self.event_processor.poll_one_event(&mut xev) {
             self.event_processor.process_event(xev, app);
+            events_in_batch += 1;
+            if events_in_batch == 64 {
+                self.event_processor.flush_outgoing_drag_motion(app);
+                events_in_batch = 0;
+            }
         }
+        self.event_processor.flush_outgoing_drag_motion(app);
     }
 
     fn control_flow(&self) -> ControlFlow {

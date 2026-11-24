@@ -373,8 +373,13 @@ impl EventProcessor {
             return false;
         }
         self.update_outgoing_drag(app, |drag| {
-            drag.motion(event.root_x as i16, event.root_y as i16, event.time as _)?;
-            if released { drag.release(event.time as _) } else { Ok(None) }
+            let (x, y, time) = (event.root_x as i16, event.root_y as i16, event.time as u32);
+            if released {
+                drag.release(x, y, time)
+            } else {
+                drag.queue_motion(x, y, time);
+                Ok(None)
+            }
         });
         true
     }
@@ -402,6 +407,13 @@ impl EventProcessor {
             }
             app.window_event(&self.target, window, event);
         }
+    }
+
+    pub(crate) fn flush_outgoing_drag_motion(&self, app: &mut dyn ApplicationHandler) {
+        self.update_outgoing_drag(app, |drag| {
+            drag.flush_motion()?;
+            Ok(None)
+        });
     }
 
     pub(crate) fn expire_outgoing_drag(&self, app: &mut dyn ApplicationHandler) {

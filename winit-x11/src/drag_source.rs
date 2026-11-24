@@ -86,6 +86,7 @@ pub(crate) struct DragSource {
     device: xinput::DeviceId,
     source_borderless: bool,
     hover: Option<Hover>,
+    pending_motion: Option<Position>,
     pointer_grabbed: bool,
     owns_selection: bool,
     acquired_at: xproto::Timestamp,
@@ -149,6 +150,7 @@ impl DragSource {
             device,
             source_borderless,
             hover: None,
+            pending_motion: None,
             pointer_grabbed: true,
             owns_selection: false,
             acquired_at: pressed_at,
@@ -175,11 +177,11 @@ impl DragSource {
         }
 
         debug!(source, device, borderless = source_borderless, "XDND source started");
-        drag.motion(
-            (pointer.root_x >> 16) as i16,
-            (pointer.root_y >> 16) as i16,
-            xconn.timestamp(),
-        )?;
+        drag.motion(Position {
+            x: (pointer.root_x >> 16) as i16,
+            y: (pointer.root_y >> 16) as i16,
+            time: xconn.timestamp(),
+        })?;
         Ok(drag)
     }
 
@@ -208,11 +210,19 @@ impl DragSource {
             || self.hover.as_ref().is_some_and(|hover| hover.target.window == window)
     }
 
-    pub(crate) fn motion(&mut self, x: i16, y: i16, time: u32) -> Result<(), X11Error> {
-        if self.release.is_some() {
-            return Ok(());
+    pub(crate) fn queue_motion(&mut self, x: i16, y: i16, time: u32) {
+        self.pending_motion = Some(Position { x, y, time });
+    }
+
+    pub(crate) fn flush_motion(&mut self) -> Result<(), X11Error> {
+        if let Some(position) = self.pending_motion.take() {
+            self.motion(position)?;
         }
-        let position = Position { x, y, time };
+        Ok(())
+    }
+
+    fn motion(&mut self, position: Position) -> Result<(), X11Error> {
+        let Position { x, y, .. } = position;
         let top = child_at(&self.xconn, self.root, self.root, position);
         let target = top.and_then(|frame| {
             target_at(
@@ -263,10 +273,14 @@ impl DragSource {
         ])
     }
 
-    pub(crate) fn release(&mut self, time: u32) -> Result<Option<bool>, X11Error> {
+    pub(crate) fn release(&mut self, x: i16, y: i16, time: u32) -> Result<Option<bool>, X11Error> {
         if self.release.is_some() {
             return Ok(None);
         }
+        // The button event supplies the definitive position even when no
+        // motion from this event batch has reached the target yet.
+        self.queue_motion(x, y, time);
+        self.flush_motion()?;
         debug!(source = self.source, hover = ?self.hover, "XDND source released");
         self.release = Some(time);
         self.release_pointer();

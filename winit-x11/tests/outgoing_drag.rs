@@ -27,6 +27,7 @@ fn completes_and_cancels_drags_between_x11_windows() {
         Scenario::CopyAcrossGap,
         Scenario::CopyAcrossOverlap,
         Scenario::CopyWithinSource,
+        Scenario::CopyAtRelease,
         Scenario::Reject,
         Scenario::Escape,
         Scenario::Copy,
@@ -58,6 +59,7 @@ enum Scenario {
     CopyAcrossGap,
     CopyAcrossOverlap,
     CopyWithinSource,
+    CopyAtRelease,
     Reject,
     Escape,
 }
@@ -66,7 +68,11 @@ impl Scenario {
     fn copies(self) -> bool {
         matches!(
             self,
-            Self::Copy | Self::CopyAcrossGap | Self::CopyAcrossOverlap | Self::CopyWithinSource
+            Self::Copy
+                | Self::CopyAcrossGap
+                | Self::CopyAcrossOverlap
+                | Self::CopyWithinSource
+                | Self::CopyAtRelease
         )
     }
 
@@ -165,7 +171,7 @@ impl ApplicationHandler for DragTest {
                 "mousemove",
                 match scenario {
                     Scenario::CopyAcrossGap | Scenario::CopyAcrossOverlap => "222",
-                    Scenario::CopyWithinSource => "150",
+                    Scenario::CopyWithinSource | Scenario::CopyAtRelease => "150",
                     _ => "400",
                 },
                 "90",
@@ -194,7 +200,12 @@ impl ApplicationHandler for DragTest {
             if scenario == Scenario::CopyAcrossGap {
                 check_selection_during_hover();
             }
-            assert!(Command::new("xdotool").args(["mouseup", "1"]).status().unwrap().success());
+            let mut release = Command::new("xdotool");
+            if scenario == Scenario::CopyAtRelease {
+                // Final motion and release arrive with no artificial delay between them.
+                release.args(["mousemove", "400", "90"]);
+            }
+            assert!(release.args(["mouseup", "1"]).status().unwrap().success());
         }));
     }
 
