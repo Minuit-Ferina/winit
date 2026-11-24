@@ -8,7 +8,7 @@ use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::{fmt, mem};
 
-use calloop::{PostAction, RegistrationToken};
+use calloop::{LoopHandle, PostAction, RegistrationToken};
 use calloop::timer::{Timer, TimeoutAction};
 use std::{cell::RefCell, rc::Rc};
 use dpi::{LogicalPosition, PhysicalPosition};
@@ -339,6 +339,17 @@ impl DataOffer {
         self.mime_types.first()
     }
 
+    #[cfg(feature = "portal")]
+    fn direct_uri_list(&self) -> Option<&MimeType> {
+        self.mime_types.iter().find(|mime| {
+            mime.hint() == Some(TypeHint::UriList)
+                && mime
+                    .mime
+                    .parse::<mime::Mime>()
+                    .is_ok_and(|mime| mime.essence_str() == TEXT_URI_LIST)
+        })
+    }
+
     fn find_type_dyn<'a>(&'a self, type_: &'a dyn TransferType) -> Option<&'a MimeType> {
         match type_.cast_ref::<MimeType>() {
             Some(mime_type) => Some(mime_type),
@@ -380,12 +391,16 @@ struct DataFetch {
     buffer: Vec<u8>,
     max_bytes: usize,
     timer: Option<RegistrationToken>,
+    deadline: Option<std::time::Instant>,
+    pipe: Option<RegistrationToken>,
     #[cfg(feature = "portal")]
     portal_bytes: Option<Vec<u8>>,
     #[cfg(feature = "portal")]
     resolve_portal: bool,
     #[cfg(feature = "portal")]
     portal_channel: Option<RegistrationToken>,
+    #[cfg(feature = "portal")]
+    portal_fallback: Option<MimeType>,
 }
 
 impl DataFetch {
@@ -403,33 +418,92 @@ impl DataFetch {
             buffer: Vec::new(),
             max_bytes: usize::MAX,
             timer: None,
+            deadline: None,
+            pipe: None,
             #[cfg(feature = "portal")]
             portal_bytes: None,
             #[cfg(feature = "portal")]
             resolve_portal: false,
             #[cfg(feature = "portal")]
             portal_channel: None,
+            #[cfg(feature = "portal")]
+            portal_fallback: None,
         }
     }
 
-    fn read(&mut self, file: &mut impl io::Read, state: &mut WinitState) -> PostAction {
+    fn receive(
+        fetch: Rc<RefCell<Self>>,
+        readfd: OwnedFd,
+        loop_handle: &LoopHandle<'static, WinitState>,
+    ) -> io::Result<()> {
+        let receive = Rc::clone(&fetch);
+        let token = loop_handle
+            .insert_source(ReadPipe::from(readfd), move |_, file, state| {
+                // SAFETY: We do not overwrite the referent of `file`.
+                let file = unsafe { file.get_mut() };
+                let action = receive.borrow_mut().read(file, state);
+                #[cfg(feature = "portal")]
+                {
+                    let bytes = receive.borrow_mut().portal_bytes.take();
+                    if let Some(bytes) = bytes {
+                        portal::resolve(Rc::clone(&receive), bytes, state);
+                    }
+                }
+                action
+            })
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        fetch.borrow_mut().pipe = Some(token);
+        Ok(())
+    }
+
+    fn close_pipe(&mut self, loop_handle: &LoopHandle<'static, WinitState>) {
+        if let Some(pipe) = self.pipe.take() {
+            loop_handle.remove(pipe);
+        }
+    }
+
+    #[cfg(feature = "portal")]
+    fn start_portal_fallback(&mut self, error: portal::PortalError) -> Option<MimeType> {
+        if self.mime_type.is_none()
+            || error != portal::PortalError::Unavailable
+            || self.deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return None;
+        }
+        let mime = self.portal_fallback.take()?;
+        self.resolve_portal = false;
+        self.mime_type = Some(mime.clone());
+        // Keep the serial, byte limit and original deadline: this is still one fetch.
+        Some(mime)
+    }
+
+    fn read_bytes(&mut self, file: &mut impl io::Read) -> Option<Result<Vec<u8>, Arc<io::Error>>> {
         // Limit each dispatch as well as total storage: an always-writing source
         // must not monopolize the event loop.
         let mut chunk = [0u8; 16 * 1024];
         let result = match file.read(&mut chunk) {
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
-                return PostAction::Continue;
+                return None;
             },
             Ok(0) => Ok(mem::take(&mut self.buffer)),
             Ok(n) if n <= self.max_bytes.saturating_sub(self.buffer.len()) => {
                 self.buffer.extend_from_slice(&chunk[..n]);
-                return PostAction::Continue;
+                return None;
             },
             Ok(_) => {
                 Err(Arc::new(io::Error::new(ErrorKind::InvalidData, "transfer exceeds byte limit")))
             },
             Err(e) => Err(Arc::new(e)),
         };
+        Some(result)
+    }
+
+    fn read(&mut self, file: &mut impl io::Read, state: &mut WinitState) -> PostAction {
+        let Some(result) = self.read_bytes(file) else {
+            return PostAction::Continue;
+        };
+        // This callback returns Remove; a later fallback installs its own pipe.
+        self.pipe = None;
         #[cfg(feature = "portal")]
         if self.resolve_portal {
             if let Ok(bytes) = result {
@@ -441,17 +515,28 @@ impl DataFetch {
         PostAction::Remove
     }
 
-    fn complete(&mut self, result: Result<Vec<u8>, Arc<io::Error>>, state: &mut WinitState) {
-        let result = result.and_then(|bytes| {
+    fn check_result(
+        &self,
+        result: Result<Vec<u8>, Arc<io::Error>>,
+    ) -> Result<Vec<u8>, Arc<io::Error>> {
+        if self.deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(Arc::new(io::Error::new(ErrorKind::TimedOut, "transfer deadline expired")));
+        }
+        result.and_then(|bytes| {
             if bytes.len() <= self.max_bytes {
                 Ok(bytes)
             } else {
                 Err(Arc::new(io::Error::new(ErrorKind::InvalidData, "transfer exceeds byte limit")))
             }
-        });
+        })
+    }
+
+    fn complete(&mut self, result: Result<Vec<u8>, Arc<io::Error>>, state: &mut WinitState) {
         if self.mime_type.is_none() {
             return;
         }
+        let result = self.check_result(result);
+        self.close_pipe(&state.loop_handle);
         #[cfg(feature = "portal")]
         if let Some(channel) = self.portal_channel.take() {
             state.loop_handle.remove(channel);
@@ -577,11 +662,11 @@ impl WinitState {
         type_: &dyn TransferType,
         limits: Option<winit_core::data_transfer::DataTransferLimits>,
     ) -> Result<AsyncRequestSerial, TransferError> {
-        if limits
-            .is_some_and(|limits| std::time::Instant::now().checked_add(limits.timeout).is_none())
-        {
-            return Err(TransferError::Failed);
-        }
+        let deadline = limits
+            .map(|limits| {
+                std::time::Instant::now().checked_add(limits.timeout).ok_or(TransferError::Failed)
+            })
+            .transpose()?;
         let Some(session) = self.data_transfer_state.session_mut(id) else {
             return Err(TransferError::UnknownTransfer(id));
         };
@@ -630,35 +715,25 @@ impl WinitState {
             Rc::new(RefCell::new(DataFetch::new(id, async_request_serial, mime_type, window_id)));
         #[cfg(feature = "portal")]
         {
-            fetch.borrow_mut().resolve_portal = resolve_portal;
+            let mut fetch = fetch.borrow_mut();
+            fetch.resolve_portal = resolve_portal;
+            if resolve_portal {
+                fetch.portal_fallback = session.data().direct_uri_list().cloned();
+            }
         }
         if let Some(limits) = limits {
             fetch.borrow_mut().max_bytes = limits.max_bytes;
         }
-        let receive = Rc::clone(&fetch);
-        let read_token = self
-            .loop_handle
-            .insert_source(ReadPipe::from(readfd), move |_, file, state| {
-                // SAFETY: We do not overwrite the referent of `file`.
-                let file = unsafe { file.get_mut() };
-                let action = receive.borrow_mut().read(file, state);
-                #[cfg(feature = "portal")]
-                {
-                    let bytes = receive.borrow_mut().portal_bytes.take();
-                    if let Some(bytes) = bytes {
-                        portal::resolve(Rc::clone(&receive), bytes, state);
-                    }
-                }
-                action
-            })
-            .map_err(|err| os_error!(io::Error::other(err.to_string())))?;
-        if let Some(limits) = limits {
+        fetch.borrow_mut().deadline = deadline;
+        DataFetch::receive(Rc::clone(&fetch), readfd, &self.loop_handle)
+            .map_err(|err| os_error!(err))?;
+        if let Some(deadline) = deadline {
             let timeout_fetch = Rc::clone(&fetch);
             match self.loop_handle.insert_source(
-                Timer::from_duration(limits.timeout),
+                Timer::from_deadline(deadline),
                 move |_, _, state| {
-                    state.loop_handle.remove(read_token);
                     let mut fetch = timeout_fetch.borrow_mut();
+                    // complete closes whichever pipe is active, including a portal fallback.
                     fetch.timer = None;
                     fetch.complete(
                         Err(Arc::new(io::Error::new(
@@ -672,7 +747,7 @@ impl WinitState {
             ) {
                 Ok(token) => fetch.borrow_mut().timer = Some(token),
                 Err(err) => {
-                    self.loop_handle.remove(read_token);
+                    fetch.borrow_mut().close_pipe(&self.loop_handle);
                     return Err(os_error!(io::Error::other(err.to_string())).into());
                 },
             }
@@ -1570,5 +1645,167 @@ mod mime_tests {
         let mime = MimeType::parse("text/plain; charset=utf-16".into());
         assert_eq!(mime.hint(), None);
         assert!(mime.parse_charset().is_err());
+    }
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use std::fs::File;
+    use std::time::Duration;
+
+    use calloop::EventLoop;
+
+    use super::*;
+
+    fn fetch() -> DataFetch {
+        DataFetch::new(
+            DataTransferId::from_raw(1),
+            AsyncRequestSerial::get(),
+            MimeType::parse(TEXT_URI_LIST.into()),
+            WindowId::from_raw(1),
+        )
+    }
+
+    #[test]
+    fn reads_yield_between_chunks_and_enforce_the_total_byte_limit() {
+        let mut fetch = fetch();
+        fetch.max_bytes = 20 * 1024;
+        let mut input = Cursor::new(vec![b'a'; fetch.max_bytes + 1]);
+        assert!(fetch.read_bytes(&mut input).is_none());
+        assert_eq!(input.position(), 16 * 1024);
+        assert_eq!(fetch.buffer.len(), 16 * 1024);
+        assert_eq!(
+            fetch.read_bytes(&mut input).unwrap().unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(fetch.buffer.len(), 16 * 1024);
+    }
+
+    #[test]
+    fn a_uri_list_at_the_byte_limit_is_delivered_without_interpretation() {
+        let bytes = b"file://remote.example/path\r\nfile:///tmp/a%20b\r\n";
+        let mut fetch = fetch();
+        fetch.max_bytes = bytes.len();
+        let mut input = Cursor::new(bytes);
+        assert!(fetch.read_bytes(&mut input).is_none());
+        assert_eq!(fetch.read_bytes(&mut input).unwrap().unwrap(), bytes);
+        assert!(fetch.buffer.is_empty());
+    }
+
+    #[test]
+    fn completion_checks_the_decoded_size_and_absolute_deadline() {
+        let mut fetch = fetch();
+        fetch.max_bytes = 3;
+        assert_eq!(fetch.check_result(Ok(b"uri".to_vec())).unwrap(), b"uri");
+        assert_eq!(
+            fetch.check_result(Ok(b"uris".to_vec())).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        fetch.deadline = Some(std::time::Instant::now() - Duration::from_secs(1));
+        // A late worker reply must fail even if the timer callback has not run yet.
+        assert_eq!(
+            fetch.check_result(Ok(b"uri".to_vec())).unwrap_err().kind(),
+            ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn closing_a_replaced_receive_pipe_closes_the_active_reader() {
+        let event_loop = EventLoop::<WinitState>::try_new().unwrap();
+        let handle = event_loop.handle();
+        let fetch = Rc::new(RefCell::new(fetch()));
+        let (readfd, writefd) = pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).unwrap();
+        DataFetch::receive(Rc::clone(&fetch), readfd, &handle).unwrap();
+        fetch.borrow_mut().close_pipe(&handle);
+        assert_eq!(
+            File::from(writefd).write_all(b"key").unwrap_err().kind(),
+            ErrorKind::BrokenPipe
+        );
+
+        // The portal read has ended; its replacement is now the only live pipe.
+        let (readfd, writefd) = pipe::pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).unwrap();
+        DataFetch::receive(Rc::clone(&fetch), readfd, &handle).unwrap();
+        let mut writer = File::from(writefd);
+        writer.write_all(b"uri").unwrap();
+        fetch.borrow_mut().close_pipe(&handle);
+        assert_eq!(writer.write_all(b"late URI data").unwrap_err().kind(), ErrorKind::BrokenPipe);
+        assert!(fetch.borrow().pipe.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "portal")]
+    fn portal_fallback_requires_an_explicitly_offered_uri_list() {
+        let id = DataTransferId::from_raw(1);
+        let portal = "application/vnd.portal.filetransfer".to_owned();
+        let offer = DataOffer::new(&[portal.clone(), TEXT_URI_LIST.into()], id);
+        assert_eq!(offer.find_type_dyn(&TypeHint::UriList).unwrap().mime.as_ref(), portal);
+        assert_eq!(offer.direct_uri_list().unwrap().mime.as_ref(), TEXT_URI_LIST);
+        assert!(DataOffer::new(&[portal], id).direct_uri_list().is_none());
+        assert!(DataOffer::new(&["text/plain".into()], id).direct_uri_list().is_none());
+        assert!(
+            DataOffer::new(&["text/uri-list;charset=utf-16".into()], id)
+                .direct_uri_list()
+                .is_none()
+        );
+        let parameterized = "text/uri-list; charset=utf-8";
+        let offer = DataOffer::new(&[parameterized.into()], id);
+        assert_eq!(offer.direct_uri_list().unwrap().mime.as_ref(), parameterized);
+    }
+
+    #[test]
+    #[cfg(feature = "portal")]
+    fn fallback_keeps_the_serial_limit_and_original_timer_and_happens_only_once() {
+        let event_loop = EventLoop::<WinitState>::try_new().unwrap();
+        let handle = event_loop.handle();
+        let mut fetch = fetch();
+        fetch.mime_type = Some(MimeType::parse("application/vnd.portal.filetransfer".into()));
+        fetch.resolve_portal = true;
+        fetch.portal_fallback = Some(MimeType::parse(TEXT_URI_LIST.into()));
+        fetch.max_bytes = 7;
+        fetch.deadline = Some(std::time::Instant::now() + Duration::from_secs(10));
+        fetch.timer = Some(
+            handle
+                .insert_source(Timer::from_duration(Duration::from_secs(10)), |_, _, _| {
+                    TimeoutAction::Drop
+                })
+                .unwrap(),
+        );
+        let timer = fetch.timer;
+        let deadline = fetch.deadline;
+        let serial = fetch.serial;
+        for error in [
+            portal::PortalError::Failed,
+            portal::PortalError::InvalidKey,
+            portal::PortalError::InvalidResponse,
+        ] {
+            assert!(fetch.start_portal_fallback(error).is_none());
+            assert!(fetch.resolve_portal);
+        }
+        assert!(fetch.start_portal_fallback(portal::PortalError::Unavailable).is_some());
+        assert_eq!(fetch.mime_type.as_ref().unwrap().mime.as_ref(), TEXT_URI_LIST);
+        assert_eq!(fetch.serial, serial);
+        assert_eq!(fetch.timer, timer);
+        assert_eq!(fetch.deadline, deadline);
+        assert_eq!(fetch.max_bytes, 7);
+        assert!(!fetch.resolve_portal);
+        assert!(fetch.start_portal_fallback(portal::PortalError::Unavailable).is_none());
+        let mut too_large = Cursor::new(b"12345678");
+        assert_eq!(
+            fetch.read_bytes(&mut too_large).unwrap().unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "portal")]
+    fn completed_or_timed_out_fetches_cannot_start_a_fallback() {
+        let mut fetch = fetch();
+        fetch.portal_fallback = Some(MimeType::parse(TEXT_URI_LIST.into()));
+        fetch.deadline = Some(std::time::Instant::now() - Duration::from_secs(1));
+        assert!(fetch.start_portal_fallback(portal::PortalError::Unavailable).is_none());
+        fetch.deadline = None;
+        fetch.mime_type = None;
+        assert!(fetch.start_portal_fallback(portal::PortalError::Unavailable).is_none());
+        assert!(fetch.pipe.is_none());
     }
 }
