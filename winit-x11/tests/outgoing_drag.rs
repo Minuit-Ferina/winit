@@ -220,7 +220,9 @@ impl ApplicationHandler for DragTest {
             self.destination.as_ref().is_some_and(|destination| destination.id() == window);
 
         let target = if self.scenario == Scenario::CopyWithinSource { source } else { destination };
-        let start_x = if event_loop.is_xwayland() || self.scenario == Scenario::CopyWithinSource {
+        let start_x = if event_loop.is_xwayland()
+            || matches!(self.scenario, Scenario::CopyWithinSource | Scenario::CopyAtRelease)
+        {
             75.0
         } else {
             180.0
