@@ -24,8 +24,8 @@ use x11_dl::xinput2::{
 use x11_dl::xlib::{
     self, Display as XDisplay, Window as XWindow, XAnyEvent, XClientMessageEvent, XConfigureEvent,
     XDestroyWindowEvent, XEvent, XExposeEvent, XKeyEvent, XMapEvent, XPropertyEvent,
-    XReparentEvent, XSelectionEvent, XSelectionRequestEvent, XVisibilityEvent, XkbAnyEvent,
-    XkbStateRec,
+    XReparentEvent, XSelectionClearEvent, XSelectionEvent, XSelectionRequestEvent,
+    XVisibilityEvent, XkbAnyEvent, XkbStateRec,
 };
 use x11rb::CURRENT_TIME;
 use x11rb::protocol::sync::{ConnectionExt, Int64};
@@ -193,10 +193,10 @@ impl EventProcessor {
             xlib::SelectionRequest => self.selection_request(xev.as_ref()),
             xlib::SelectionNotify => self.selection_notify(xev.as_ref(), app),
             xlib::SelectionClear => {
-                let event: &XSelectionEvent = xev.as_ref();
+                let event: &XSelectionClearEvent = xev.as_ref();
                 if event.selection as xproto::Atom == self.target.xconn.atoms()[XdndSelection] {
                     self.update_outgoing_drag(app, |drag| {
-                        Ok((drag.source() == event.requestor as _).then_some(false))
+                        Ok(drag.selection_lost(event.window as _, event.time as _).then_some(false))
                     });
                 } else {
                     self.selection_clear(event);
@@ -239,15 +239,17 @@ impl EventProcessor {
                         let xev: &XIDeviceEvent = unsafe { xev.as_event() };
                         if xev.detail == 1 {
                             if state == ElementState::Pressed {
-                                self.target
-                                    .drag_pointer
-                                    .set(Some((mkwid(xev.event as _), xev.deviceid as _)));
+                                self.target.drag_pointer.set(Some((
+                                    mkwid(xev.event as _),
+                                    xev.deviceid as _,
+                                    xev.time as _,
+                                )));
                             } else {
                                 if self
                                     .target
                                     .drag_pointer
                                     .get()
-                                    .is_some_and(|(_, device)| i32::from(device) == xev.deviceid)
+                                    .is_some_and(|(_, device, _)| i32::from(device) == xev.deviceid)
                                 {
                                     self.target.drag_pointer.set(None);
                                 }
@@ -395,7 +397,7 @@ impl EventProcessor {
             outcome.and_then(|success| outgoing.take().map(|drag| drag.finish(success)))
         };
         if let Some((window, event)) = event {
-            if self.target.drag_pointer.get().is_some_and(|(source, _)| source == window) {
+            if self.target.drag_pointer.get().is_some_and(|(source, ..)| source == window) {
                 self.target.drag_pointer.set(None);
             }
             app.window_event(&self.target, window, event);
@@ -680,14 +682,21 @@ impl EventProcessor {
 
         if xev.message_type == atoms[XdndDrop] as c_ulong {
             let (source_window, transfer_id) = {
-                let dnd = self.target.data_transfer_state.borrow();
-                let Some(state) = dnd.state() else {
+                let mut dnd = self.target.data_transfer_state.borrow_mut();
+                let Some(state) = dnd.state_mut() else {
                     warn!("Received `XdndDrop` without `XdndEnter`");
                     return;
                 };
-                let source_window = state.source_window;
+                if state.source_window != xev.data.get_long(0) as xproto::Window
+                    || state.target_window != window
+                {
+                    return;
+                }
+                if state.version > 0 {
+                    state.drop_time = xev.data.get_long(2) as xproto::Timestamp;
+                }
 
-                (source_window, state.transfer_id)
+                (state.source_window, state.transfer_id)
             };
 
             app.window_event(
@@ -819,7 +828,7 @@ impl EventProcessor {
     }
 
     /// Handles the X11 `SelectionClear` which occurs when we used to own a selection but now do not
-    fn selection_clear(&mut self, xev: &XSelectionEvent) {
+    fn selection_clear(&mut self, xev: &XSelectionClearEvent) {
         let atoms = self.target.x_connection().atoms();
         let Some(clipboard) = ClipboardSelectionType::from_atom(atoms, xev.selection as _) else {
             return;
@@ -897,19 +906,23 @@ impl EventProcessor {
         let mut data_transfer = self.target.data_transfer_state.borrow_mut();
 
         // If we have another fetch pending, request it from the drag source window
-        if let Some((window, type_)) = data_transfer.state().and_then(|state| {
+        if let Some((window, type_, drop_time)) = data_transfer.state().and_then(|state| {
             state
                 .pending_fetch_types
                 .front()
                 .cloned()
-                .map(|(_, type_)| (state.target_window, type_))
+                .map(|(_, type_)| (state.target_window, type_, state.drop_time))
         }) {
             let selection = self.target.xconn.atoms()[XdndSelection];
             // TODO: The result is stored into a property named XdndSelection. Consider using a
             // different name to avoid conflict.
-            if let Err(err) =
-                self.target.xconn.convert_selection(window, selection, type_.atom(), selection)
-            {
+            if let Err(err) = self.target.xconn.convert_selection(
+                window,
+                selection,
+                type_.atom(),
+                selection,
+                drop_time,
+            ) {
                 error!("Could not convert the dropped selection: {err}");
             }
         } else if let Some((this_window, target_window)) =

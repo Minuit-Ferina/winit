@@ -178,7 +178,7 @@ pub struct ActiveEventLoop {
     pub(crate) xconn: Arc<XConnection>,
     pub(crate) data_transfer_state: RefCell<DataTransferState>,
     pub(crate) outgoing_drag: RefCell<Option<DragSource>>,
-    pub(crate) drag_pointer: Cell<Option<(WindowId, xinput::DeviceId)>>,
+    pub(crate) drag_pointer: Cell<Option<(WindowId, xinput::DeviceId, xproto::Timestamp)>>,
     pub(crate) wm_delete_window: xproto::Atom,
     pub(crate) net_wm_ping: xproto::Atom,
     pub(crate) net_wm_sync_request: xproto::Atom,
@@ -967,7 +967,8 @@ impl RootActiveEventLoop for ActiveEventLoop {
         if outgoing.is_some() {
             return Err(TransferError::Failed);
         }
-        let Some((_, device)) = self.drag_pointer.get().filter(|&(window, _)| window == source)
+        let Some((_, device, pressed_at)) =
+            self.drag_pointer.get().filter(|&(window, ..)| window == source)
         else {
             return Err(TransferError::Failed);
         };
@@ -976,6 +977,7 @@ impl RootActiveEventLoop for ActiveEventLoop {
             source.into_raw() as _,
             self.root,
             device,
+            pressed_at,
             !window.is_decorated(),
             data,
         )

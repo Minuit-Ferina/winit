@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use winit_core::cursor::CursorIcon;
-use winit_core::data_transfer::{DataTransferId, DataTransferSend, SendData};
+use winit_core::data_transfer::{DataTransferId, DataTransferSend};
 use winit_core::event::WindowEvent;
 use winit_core::event_loop::DndAction;
 use winit_core::window::WindowId;
@@ -16,7 +16,7 @@ use x11rb::protocol::xproto::{self, ConnectionExt as _, EventMask};
 use x11rb::{CURRENT_TIME, NONE};
 
 use crate::atoms::*;
-use crate::data_transfer::{SelectionType, encode_uri_list, generate_transfer_id};
+use crate::data_transfer::{SelectionType, generate_transfer_id};
 use crate::event_loop::X11Error;
 use crate::xdisplay::XConnection;
 
@@ -88,6 +88,7 @@ pub(crate) struct DragSource {
     hover: Option<Hover>,
     pointer_grabbed: bool,
     owns_selection: bool,
+    acquired_at: xproto::Timestamp,
     release: Option<u32>,
     dropped: bool,
     deadline: Option<Instant>,
@@ -99,6 +100,7 @@ impl DragSource {
         source: xproto::Window,
         root: xproto::Window,
         device: xinput::DeviceId,
+        pressed_at: xproto::Timestamp,
         source_borderless: bool,
         data: Box<dyn DataTransferSend>,
     ) -> Result<Self, X11Error> {
@@ -149,12 +151,13 @@ impl DragSource {
             hover: None,
             pointer_grabbed: true,
             owns_selection: false,
+            acquired_at: pressed_at,
             release: None,
             dropped: false,
             deadline: None,
         };
 
-        conn.set_selection_owner(source, selection, CURRENT_TIME)?.check()?;
+        conn.set_selection_owner(source, selection, pressed_at)?.check()?;
         drag.owns_selection = conn.get_selection_owner(selection)?.reply()?.owner == source;
         if !drag.owns_selection {
             return Err(X11Error::UnexpectedNull("XDND selection owner"));
@@ -192,6 +195,10 @@ impl DragSource {
         self.source
     }
 
+    pub(crate) fn selection_lost(&self, window: xproto::Window, time: xproto::Timestamp) -> bool {
+        self.source == window && timestamp_is_current(time, self.acquired_at)
+    }
+
     pub(crate) fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
@@ -219,13 +226,7 @@ impl DragSource {
 
         trace!(source = self.source, x, y, ?top, ?target, "XDND source hit test");
         if self.hover.as_ref().map(|hover| hover.target) != target {
-            debug!(
-                source = self.source,
-                ?target,
-                x,
-                y,
-                "XDND source changed target"
-            );
+            debug!(source = self.source, ?target, x, y, "XDND source changed target");
             self.leave();
             if let Some(target) = target {
                 let mut data = [self.source, target.version << 24, NONE, NONE, NONE];
@@ -343,8 +344,12 @@ impl DragSource {
         let property = if request.property == 0 { target } else { request.property as _ };
         // XWayland compositors may discover the offered formats as soon as
         // the drag claims XdndSelection. Reading the payload still needs a drop.
-        let metadata = target == self.xconn.atoms()[TARGETS];
-        let result = if request.owner == self.source as _ && (metadata || self.dropped) {
+        let atoms = self.xconn.atoms();
+        let metadata = target == atoms[TARGETS] || target == atoms[TIMESTAMP];
+        let result = if request.owner == self.source as _
+            && timestamp_is_current(request.time as _, self.acquired_at)
+            && (metadata || self.dropped)
+        {
             self.write_selection(requestor, target, property)
         } else {
             Ok(false)
@@ -374,7 +379,7 @@ impl DragSource {
     ) -> Result<bool, X11Error> {
         let atoms = self.xconn.atoms();
         if target == atoms[TARGETS] {
-            let mut types = vec![atoms[TARGETS]];
+            let mut types = vec![atoms[TARGETS], atoms[TIMESTAMP]];
             types.extend(&self.types);
             self.xconn
                 .change_property(
@@ -387,17 +392,24 @@ impl DragSource {
                 .check()?;
             return Ok(true);
         }
+        if target == atoms[TIMESTAMP] {
+            self.xconn
+                .change_property(
+                    requestor,
+                    property,
+                    xproto::AtomEnum::INTEGER.into(),
+                    xproto::PropMode::REPLACE,
+                    &[self.acquired_at],
+                )?
+                .check()?;
+            return Ok(true);
+        }
         if !self.types.contains(&target) {
             return Ok(false);
         }
-        let Some(data) = self.data.data_for_type(&SelectionType::new(atoms, target)) else {
+        let ty = SelectionType::new(atoms, target);
+        let Some(bytes) = self.data.data_for_type(&ty).and_then(|data| ty.encode(data)) else {
             return Ok(false);
-        };
-        let bytes = match data {
-            SendData::Uris(uris) => encode_uri_list(uris),
-            SendData::String(value) => value.into_bytes(),
-            SendData::Bytes(value) => value,
-            _ => return Ok(false),
         };
         // This source sends a single property. Larger selections need the ICCCM INCR protocol.
         if bytes.len() > self.xconn.xcb_connection().maximum_request_bytes().saturating_sub(32) {
@@ -471,12 +483,20 @@ impl Drop for DragSource {
                 .and_then(|cookie| cookie.reply().ok())
                 .is_some_and(|reply| reply.owner == self.source)
         {
-            if let Ok(cookie) = conn.set_selection_owner(NONE, selection, CURRENT_TIME) {
+            // With the original acquisition time, a later owner wins even
+            // if it takes over between the ownership check and this request.
+            if let Ok(cookie) = conn.set_selection_owner(NONE, selection, self.acquired_at) {
                 cookie.ignore_error();
             }
         }
         let _ = conn.flush();
     }
+}
+
+fn timestamp_is_current(requested_at: xproto::Timestamp, acquired_at: xproto::Timestamp) -> bool {
+    // CurrentTime carries no generation information, but is still used by
+    // selection clients. For real timestamps compare across 32-bit wraparound.
+    requested_at == CURRENT_TIME || requested_at.wrapping_sub(acquired_at) as i32 >= 0
 }
 
 fn advertised_types(xconn: &XConnection, data: &dyn DataTransferSend) -> Vec<xproto::Atom> {
@@ -603,4 +623,25 @@ fn window_contains_point(xconn: &XConnection, window: xproto::Window, position: 
                 })
             })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use x11rb::CURRENT_TIME;
+
+    use super::timestamp_is_current;
+
+    #[test]
+    fn selection_requests_respect_the_acquisition_timestamp() {
+        assert!(!timestamp_is_current(10, 20));
+        assert!(timestamp_is_current(20, 20));
+        assert!(timestamp_is_current(21, 20));
+        assert!(timestamp_is_current(CURRENT_TIME, 20));
+    }
+
+    #[test]
+    fn selection_timestamps_can_wrap() {
+        assert!(!timestamp_is_current(u32::MAX, 1));
+        assert!(timestamp_is_current(1, u32::MAX));
+    }
 }

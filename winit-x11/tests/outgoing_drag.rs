@@ -16,7 +16,7 @@ use x11rb::connection::Connection as _;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
 
-const PAYLOAD: &str = "winit XDND source";
+const PAYLOAD: &str = "winit XDND source: caf\u{e9} \u{3a9}";
 
 #[test]
 #[ignore = "requires a disposable X11 display and xdotool"]

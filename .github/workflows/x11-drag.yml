@@ -1,0 +1,28 @@
+name: X11 drag tests
+
+on:
+  pull_request:
+    paths:
+      - 'winit-x11/**'
+      - '.github/workflows/x11-drag.yml'
+  push:
+    branches: [codex/winit-x11-drag-review, codex/winit-x11-drag-motion]
+
+permissions:
+  contents: read
+
+jobs:
+  x11-drag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install X11 test dependencies
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxi-dev libxkbcommon-x11-dev xauth xdotool xvfb
+      - name: Test X11 backend logic
+        run: cargo test -p winit-x11 --lib
+      - name: Test native drag and drop
+        run: xvfb-run -a cargo test -p winit-x11 --test outgoing_drag -- --ignored

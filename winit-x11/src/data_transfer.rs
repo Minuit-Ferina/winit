@@ -86,6 +86,9 @@ impl TypedData for SelectionReader {
         }
 
         match self.type_.hint() {
+            Some(TypeHint::Plaintext) if self.type_.latin1 => {
+                Ok(self.data.iter().copied().map(char::from).collect())
+            },
             Some(TypeHint::Plaintext) | Some(TypeHint::Html) => std::str::from_utf8(&self.data)
                 .map(|str| str.to_owned())
                 .map_err(invalid_data)
@@ -119,6 +122,7 @@ pub struct DragState {
     pub source_window: xproto::Window,
     // Populated by Xdnd* event handlers
     pub target_window: xproto::Window,
+    pub drop_time: xproto::Timestamp,
     // Populated by `fetch_data_transfer`
     pub pending_fetch_types: VecDeque<(AsyncRequestSerial, SelectionType)>,
     pub finished: Option<(XWindow, XWindow)>,
@@ -142,6 +146,7 @@ impl Default for DragState {
             types: Default::default(),
             source_window: Default::default(),
             target_window: Default::default(),
+            drop_time: CURRENT_TIME,
             pending_fetch_types: Default::default(),
             finished: None,
             accepted: Default::default(),
@@ -342,6 +347,7 @@ impl FinishedDataTransfer {
 pub struct SelectionType {
     hint: Option<TypeHint>,
     atom: xproto::Atom,
+    latin1: bool,
 }
 
 impl SelectionType {
@@ -350,10 +356,10 @@ impl SelectionType {
             // Files
             (atoms[TextUriList], TypeHint::UriList),
             // Plaintext
-            (atoms[STRING], TypeHint::Plaintext),
             (atoms[UTF8_STRING], TypeHint::Plaintext),
-            (atoms[TextPlain], TypeHint::Plaintext),
             (atoms[TextPlainCharsetUtf8], TypeHint::Plaintext),
+            (atoms[TextPlain], TypeHint::Plaintext),
+            (atoms[STRING], TypeHint::Plaintext),
             // HTML
             (atoms[TextHtml], TypeHint::Html),
             (atoms[TextHtmlCharsetUtf8], TypeHint::Html),
@@ -389,7 +395,7 @@ impl SelectionType {
         let hint =
             Self::atom_hints(atoms).find_map(|(haystack, hint)| (haystack == atom).then_some(hint));
 
-        Self { hint, atom }
+        Self { hint, atom, latin1: atom == atoms[STRING] }
     }
 
     pub(crate) fn from_dyn(atoms: &Atoms, type_: &dyn TransferType) -> impl Iterator<Item = Self> {
@@ -401,7 +407,11 @@ impl SelectionType {
             .then_some(
                 Self::atom_hints(atoms)
                     .filter(|(_, haystack)| TransferType::matches(haystack, type_))
-                    .map(|(atom, hint)| Self { atom, hint: Some(hint) }),
+                    .map(|(atom, hint)| Self {
+                        atom,
+                        hint: Some(hint),
+                        latin1: atom == atoms[STRING],
+                    }),
             )
             .into_iter()
             .flatten();
@@ -411,6 +421,20 @@ impl SelectionType {
 
     pub fn atom(&self) -> xproto::Atom {
         self.atom
+    }
+
+    pub(crate) fn encode(&self, data: SendData) -> Option<Vec<u8>> {
+        match data {
+            SendData::Uris(uris) => Some(encode_uri_list(uris)),
+            // ICCCM STRING is Latin-1. Reject unrepresentable text instead of
+            // writing UTF-8 bytes under a different encoding.
+            SendData::String(text) if self.latin1 => {
+                text.chars().map(|character| u8::try_from(u32::from(character)).ok()).collect()
+            },
+            SendData::String(text) => Some(text.into_bytes()),
+            SendData::Bytes(bytes) => Some(bytes),
+            _ => None,
+        }
     }
 }
 
@@ -650,14 +674,9 @@ impl DataTransferState {
                 );
                 return false;
             };
-            let data = match send_data {
-                SendData::Uris(strings) => encode_uri_list(strings),
-                SendData::String(str) => str.into_bytes(),
-                SendData::Bytes(binary) => binary,
-                _ => {
-                    warn!("Unknown send data {send_data:?}");
-                    return false;
-                },
+            let Some(data) = ty.encode(send_data) else {
+                debug!("Clipboard data cannot be encoded as {}", self.xconn.atom_str(target));
+                return false;
             };
 
             if data.len() < INCR_CHUNK_SIZE_BYTES {
@@ -786,7 +805,13 @@ impl DataTransferState {
     ) {
         let selection = clipboard.selection_atom(self.xconn.atoms());
         while let Some((_, ty)) = self.get_clipboard(clipboard).pending_fetch_types.front() {
-            match self.xconn.convert_selection(xwindow, selection, ty.atom(), selection) {
+            match self.xconn.convert_selection(
+                xwindow,
+                selection,
+                ty.atom(),
+                selection,
+                CURRENT_TIME,
+            ) {
                 Ok(()) => {
                     trace!("Converting next selection {}", self.xconn.atom_str(ty.atom()));
                     return;
@@ -916,7 +941,9 @@ impl DataTransferState {
         let atoms = self.xconn.atoms();
         let selection = clipboard.selection_atom(atoms);
         let property = clipboard.property_atom(atoms);
-        if let Err(e) = self.xconn.convert_selection(xwindow, selection, atoms[TARGETS], property) {
+        if let Err(e) =
+            self.xconn.convert_selection(xwindow, selection, atoms[TARGETS], property, CURRENT_TIME)
+        {
             let selection = self.xconn.atom_str(selection);
             let property = self.xconn.atom_str(property);
             error!("Unable to request TARGETS for {selection} into {property}: {e}")
@@ -969,9 +996,13 @@ impl DataTransferState {
         if should_emit_convert_selection {
             // TODO: The result is stored into a property with the same name as the selection.
             // Consider using a different name to avoid conflict.
-            if let Err(e) =
-                self.xconn.convert_selection(state.target_window, selection, atom, selection)
-            {
+            if let Err(e) = self.xconn.convert_selection(
+                state.target_window,
+                selection,
+                atom,
+                selection,
+                state.drop_time,
+            ) {
                 return Err(TransferError::Os(os_error!(format!(
                     "could not convert selection: {e}"
                 ))));
@@ -1023,5 +1054,31 @@ impl DataTransferState {
         }
         self.clip_incr_receive.retain(|receive| receive.clipboard != clipboard);
         self.clip_incr_send.retain(|receive| receive.clipboard != clipboard);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_string_uses_latin1_in_both_directions() {
+        let type_ = SelectionType { hint: Some(TypeHint::Plaintext), atom: 31, latin1: true };
+        let data = type_.encode(SendData::String("caf\u{e9}".into())).unwrap();
+        assert_eq!(data, b"caf\xe9");
+        assert_eq!(
+            SelectionReader { type_: type_.clone(), data }.try_as_string().unwrap(),
+            "caf\u{e9}"
+        );
+        assert!(type_.encode(SendData::String("\u{3a9}".into())).is_none());
+    }
+
+    #[test]
+    fn utf8_selection_preserves_non_latin1_text() {
+        let type_ = SelectionType { hint: Some(TypeHint::Plaintext), atom: 1, latin1: false };
+        let text = "caf\u{e9} \u{3a9}";
+        let data = type_.encode(SendData::String(text.into())).unwrap();
+        assert_eq!(data, text.as_bytes());
+        assert_eq!(SelectionReader { type_, data }.try_as_string().unwrap(), text);
     }
 }

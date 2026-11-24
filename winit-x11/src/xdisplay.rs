@@ -340,6 +340,7 @@ impl XConnection {
         selection: xproto::Atom,
         target: xproto::Atom,
         property: xproto::Atom,
+        time: xproto::Timestamp,
     ) -> Result<(), X11Error> {
         trace!(
             "Requesting {} from selection {} into property {}",
@@ -354,7 +355,7 @@ impl XConnection {
         }
 
         self.xcb_connection()
-            .convert_selection(xwindow, selection, target, property, CURRENT_TIME)?
+            .convert_selection(xwindow, selection, target, property, time)?
             .check()?;
 
         Ok(())
