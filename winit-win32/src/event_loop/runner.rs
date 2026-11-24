@@ -19,6 +19,7 @@ use winit_core::event::{DeviceEvent, DeviceId, StartCause, SurfaceSizeWriter, Wi
 use winit_core::event_loop::ActiveEventLoop as RootActiveEventLoop;
 use winit_core::window::WindowId;
 
+use super::local_drag::LocalDrag;
 use super::{ActiveEventLoop, ControlFlow, EventLoopThreadExecutor};
 use crate::data_transfer::{
     DataTransferState, DropEffect, DropSource, SourceDataObject, drop_effect_to_dnd_action,
@@ -65,6 +66,7 @@ pub(crate) struct EventLoopRunner {
 
     /// The in-progress drag-and-drop and clipboard transfers.
     data_transfer: DataTransferState,
+    pub(super) local_drag: RefCell<Option<LocalDrag>>,
 
     /// All currently-open windows, for events that are not tied to a single window.
     windows: RefCell<Vec<WindowId>>,
@@ -139,6 +141,7 @@ impl EventLoopRunner {
             event_handler: Rc::new(Cell::new(None)),
             event_buffer: RefCell::new(VecDeque::new()),
             data_transfer: DataTransferState::default(),
+            local_drag: RefCell::new(None),
             windows: RefCell::new(Vec::new()),
             source_drag: Cell::new(None),
             pending_drag: RefCell::new(None),
@@ -230,8 +233,10 @@ impl EventLoopRunner {
         self.windows.borrow_mut().push(id);
     }
 
-    pub(crate) fn unregister_window(&self, id: WindowId) {
+    pub(crate) fn unregister_window(self: &Rc<Self>, id: WindowId) {
         self.windows.borrow_mut().retain(|window| *window != id);
+        self.data_transfer.remove_local_target(id);
+        self.local_drag_window_destroyed(id);
     }
 
     pub(super) fn clipboard_window(&self) -> Option<WindowId> {
@@ -293,6 +298,7 @@ impl EventLoopRunner {
             event_handler,
             event_buffer: _,
             data_transfer,
+            local_drag,
             windows: _,
             source_drag,
             pending_drag,
@@ -304,6 +310,7 @@ impl EventLoopRunner {
         exit.set(None);
         event_handler.set(None);
         data_transfer.reset();
+        local_drag.take();
         source_drag.set(None);
         pending_drag.take();
         pending_source_drag_cleanup.set(None);

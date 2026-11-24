@@ -43,7 +43,7 @@ use windows_sys::Win32::UI::Input::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     EnumThreadWindows, GW_OWNER, GWL_STYLE, GWL_USERDATA, GetClientRect, GetCursorPos, GetMenu,
-    GetWindow, HTCAPTION, HTCLIENT, LoadCursorW, MINMAXINFO, MNC_CLOSE, MSG, MWMO_INPUTAVAILABLE,
+    GetWindow, HTCAPTION, HTCLIENT, MINMAXINFO, MNC_CLOSE, MSG, MWMO_INPUTAVAILABLE,
     MsgWaitForMultipleObjectsEx, NCCALCSIZE_PARAMS, PEN_FLAG_BARREL, PEN_FLAG_ERASER,
     PEN_MASK_PRESSURE, PEN_MASK_ROTATION, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, PM_REMOVE, PT_PEN,
     PT_TOUCH, PeekMessageW, PostMessageW, QS_ALLINPUT, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL,
@@ -85,6 +85,7 @@ use winit_core::keyboard::ModifiersState;
 use winit_core::monitor::{Fullscreen, MonitorHandle as CoreMonitorHandle};
 use winit_core::window::{Theme, Window as CoreWindow, WindowAttributes, WindowId};
 
+mod local_drag;
 pub(super) use self::runner::{Event, EventLoopRunner};
 use super::SelectedCursor;
 use super::window::set_skip_taskbar;
@@ -94,7 +95,7 @@ use crate::data_transfer::{
 };
 use crate::dpi::{become_dpi_aware, dpi_to_scale_factor};
 use crate::event_loop::runner::PendingDrag;
-use crate::icon::WinCursor;
+use crate::icon::{WinCursor, load_named_cursor};
 use crate::ime::ImeContext;
 use crate::keyboard::KeyEventBuilder;
 use crate::keyboard_layout::LAYOUT_CACHE;
@@ -624,6 +625,10 @@ impl RootActiveEventLoop for ActiveEventLoop {
         allowed_actions: &[DndAction],
         icon: Option<DragIcon>,
     ) -> Result<DataTransferId, TransferError> {
+        if icon.is_none() {
+            let effects = crate::data_transfer::dnd_actions_to_dropeffect_mask(allowed_actions);
+            return self.0.start_local_drag(source, send_data, effects);
+        }
         self.start_drag_impl(source, send_data, allowed_actions, icon, true)
     }
 }
@@ -637,7 +642,10 @@ impl ActiveEventLoop {
         icon: Option<DragIcon>,
         internal: bool,
     ) -> Result<DataTransferId, TransferError> {
-        if self.0.source_drag.get().is_some() || self.0.pending_drag.borrow().is_some() {
+        if self.0.source_drag.get().is_some()
+            || self.0.pending_drag.borrow().is_some()
+            || self.0.local_drag.borrow().is_some()
+        {
             return Err(TransferError::Failed);
         }
 
@@ -1796,6 +1804,11 @@ unsafe fn public_window_callback_inner(
             let y = util::get_y_lparam(lparam as u32) as i32;
             let position = PhysicalPosition::new(x as f64, y as f64);
 
+            if userdata.event_loop_runner.local_drag_motion(window, x, y, wparam as u32) {
+                result = ProcResult::Value(0);
+                return;
+            }
+
             let cursor_moved;
             {
                 let mut w = userdata.window_state_lock();
@@ -1955,6 +1968,9 @@ unsafe fn public_window_callback_inner(
         },
 
         WM_KEYDOWN | WM_SYSKEYDOWN => {
+            if wparam == windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE as usize {
+                userdata.event_loop_runner.cancel_local_drag(window);
+            }
             if msg == WM_SYSKEYDOWN {
                 result = ProcResult::DefWindowProc(wparam);
             }
@@ -2003,6 +2019,7 @@ unsafe fn public_window_callback_inner(
             use winit_core::event::MouseButton;
             use winit_core::event::WindowEvent::PointerButton;
 
+            userdata.event_loop_runner.release_local_drag(window, lparam as u32, wparam as u32);
             unsafe { release_mouse(userdata.window_state_lock()) };
 
             update_modifiers(window, userdata);
@@ -2058,6 +2075,7 @@ unsafe fn public_window_callback_inner(
         },
 
         WM_XBUTTONUP => {
+            userdata.event_loop_runner.release_local_drag(window, lparam as u32, wparam as u32);
             use winit_core::event::ElementState::Released;
             use winit_core::event::MouseButton;
             use winit_core::event::WindowEvent::PointerButton;
@@ -2094,6 +2112,7 @@ unsafe fn public_window_callback_inner(
             // capture.
             if lparam != window as isize {
                 userdata.window_state_lock().mouse.capture_count = 0;
+                userdata.event_loop_runner.cancel_local_drag(window);
             }
             result = ProcResult::Value(0);
         },
@@ -2382,6 +2401,7 @@ unsafe fn public_window_callback_inner(
         },
 
         WM_KILLFOCUS => {
+            userdata.event_loop_runner.cancel_local_drag(window);
             let active_focus_changed = userdata.window_state_lock().set_focused(false);
             if active_focus_changed {
                 unsafe { lose_active_focus(window, userdata) };
@@ -2390,6 +2410,10 @@ unsafe fn public_window_callback_inner(
         },
 
         WM_SETCURSOR => {
+            if userdata.event_loop_runner.set_local_drag_cursor(window) {
+                result = ProcResult::Value(0);
+                return;
+            }
             let set_cursor_to = {
                 let window_state = userdata.window_state_lock();
                 // The return value for the preceding `WM_NCHITTEST` message is conveniently
@@ -2402,9 +2426,7 @@ unsafe fn public_window_callback_inner(
             match set_cursor_to {
                 Some(selected_cursor) => {
                     let hcursor = match selected_cursor {
-                        SelectedCursor::Named(cursor_icon) => unsafe {
-                            LoadCursorW(ptr::null_mut(), util::to_windows_cursor(cursor_icon))
-                        },
+                        SelectedCursor::Named(cursor_icon) => load_named_cursor(cursor_icon),
                         SelectedCursor::Custom(cursor) => cursor.as_raw_handle(),
                     };
                     unsafe { SetCursor(hcursor) };

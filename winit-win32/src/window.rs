@@ -39,10 +39,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetCursorPos, GetForegroundWindow, GetParent, GetSystemMenu, GetSystemMetrics,
     GetWindowPlacement, GetWindowTextLengthW, GetWindowTextW, HTBOTTOM, HTBOTTOMLEFT,
     HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IsWindowVisible,
-    LoadCursorW, MENU_ITEM_STATE, MF_BYCOMMAND, MFS_DISABLED, MFS_ENABLED, NID_READY, PM_NOREMOVE,
-    PeekMessageW, PostMessageW, RegisterClassExW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE,
-    SC_RESTORE, SC_SIZE, SM_DIGITIZER, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE,
-    SWP_NOZORDER, SendMessageW, SetCursor, SetCursorPos, SetForegroundWindow, SetMenuDefaultItem,
+    MENU_ITEM_STATE, MF_BYCOMMAND, MFS_DISABLED, MFS_ENABLED, NID_READY, PM_NOREMOVE, PeekMessageW,
+    PostMessageW, RegisterClassExW, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE,
+    SC_SIZE, SM_DIGITIZER, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    SendMessageW, SetCursor, SetCursorPos, SetForegroundWindow, SetMenuDefaultItem,
     SetWindowDisplayAffinity, SetWindowPlacement, SetWindowPos, SetWindowTextW, TPM_LEFTALIGN,
     TPM_RETURNCMD, TrackPopupMenu, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_NCLBUTTONDOWN, WM_SETICON,
     WM_SYSCOMMAND, WNDCLASSEXW,
@@ -65,7 +65,7 @@ use crate::definitions::{
 };
 use crate::dpi::{dpi_to_scale_factor, enable_non_client_dpi_scaling, hwnd_dpi};
 use crate::event_loop::{self, ActiveEventLoop, DESTROY_MSG_ID, Event, EventLoopRunner};
-use crate::icon::{IconType, WinCursor};
+use crate::icon::{IconType, WinCursor, load_named_cursor};
 use crate::ime::ImeContext;
 use crate::keyboard::KeyEventBuilder;
 use crate::monitor::MonitorHandle;
@@ -689,7 +689,7 @@ impl CoreWindow for Window {
             Cursor::Icon(icon) => {
                 self.window_state_lock().mouse.selected_cursor = SelectedCursor::Named(icon);
                 self.thread_executor.execute_in_thread(move || unsafe {
-                    let cursor = LoadCursorW(ptr::null_mut(), util::to_windows_cursor(icon));
+                    let cursor = load_named_cursor(icon);
                     SetCursor(cursor);
                 });
             },

@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::{fmt, io, mem, ptr};
 
 use cursor_icon::CursorIcon;
@@ -9,11 +9,12 @@ use windows_sys::Win32::Graphics::Gdi::{
     CreateBitmap, CreateCompatibleBitmap, DeleteObject, GetDC, ReleaseDC, SetBitmapBits,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateIcon, CreateIconIndirect, DestroyCursor, DestroyIcon, HCURSOR, HICON, ICON_BIG,
-    ICON_SMALL, ICONINFO, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, LoadImageW,
+    CreateIcon, CreateIconIndirect, DestroyCursor, DestroyIcon, GetSystemMetrics, HCURSOR, HICON,
+    ICON_BIG, ICON_SMALL, ICONINFO, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, LoadCursorW,
+    LoadImageW, SM_CXCURSOR, SM_CYCURSOR,
 };
 use windows_sys::core::PCWSTR;
-use winit_core::cursor::{CursorImage, CustomCursorProvider};
+use winit_core::cursor::{CursorImage, CustomCursorProvider, CustomCursorSource, MAX_CURSOR_SIZE};
 use winit_core::error::CustomCursorError;
 use winit_core::icon::*;
 
@@ -158,6 +159,97 @@ impl Drop for RaiiIcon {
     }
 }
 
+pub(crate) fn load_named_cursor(icon: CursorIcon) -> HCURSOR {
+    // Win32 doesn't assign a standard resource ID to the copy cursor. Keep
+    // our equivalent alive for every window using it, including while dragging.
+    if icon == CursorIcon::Copy {
+        static COPY_CURSOR: OnceLock<Option<WinCursor>> = OnceLock::new();
+        if let Some(cursor) = COPY_CURSOR.get_or_init(create_copy_cursor) {
+            return cursor.0.as_raw_handle();
+        }
+    }
+    // SAFETY: The resource identifier selects a shared stock cursor.
+    unsafe { LoadCursorW(ptr::null_mut(), util::to_windows_cursor(icon)) }
+}
+
+fn create_copy_cursor() -> Option<WinCursor> {
+    // SAFETY: These metrics describe the system's cursor bitmap dimensions.
+    let (width, height) = unsafe { (GetSystemMetrics(SM_CXCURSOR), GetSystemMetrics(SM_CYCURSOR)) };
+    let size = |metric: i32| {
+        u16::try_from(metric).ok().filter(|size| (1..=MAX_CURSOR_SIZE).contains(size)).unwrap_or(32)
+    };
+    let (width, height) = (size(width), size(height));
+    let CustomCursorSource::Image(image) =
+        CustomCursorSource::from_rgba(copy_cursor_rgba(width, height), width, height, 0, 0).ok()?
+    else {
+        return None;
+    };
+    WinCursor::new(&image).ok()
+}
+
+// A tip-anchored arrow and a high-contrast copy badge on a 32-pixel grid.
+fn copy_cursor_rgba(width: u16, height: u16) -> Vec<u8> {
+    const ARROW: &[&[u8]] = &[
+        b"#",
+        b"##",
+        b"#.#",
+        b"#..#",
+        b"#...#",
+        b"#....#",
+        b"#.....#",
+        b"#......#",
+        b"#.......#",
+        b"#........#",
+        b"#.........#",
+        b"#..........#",
+        b"#......######",
+        b"#...#..#",
+        b"#..##..#",
+        b"#.#  #..#",
+        b"##   #..#",
+        b"#     #..#",
+        b"      #..#",
+        b"       ##",
+    ];
+    const BADGE: &[&[u8]] = &[
+        b"###########",
+        b"#.........#",
+        b"#....#....#",
+        b"#....#....#",
+        b"#....#....#",
+        b"#.#######.#",
+        b"#....#....#",
+        b"#....#....#",
+        b"#....#....#",
+        b"#.........#",
+        b"###########",
+    ];
+    const GRID: usize = 32;
+    const BADGE_X: usize = 13;
+    const BADGE_Y: usize = 13;
+
+    let (width, height) = (usize::from(width), usize::from(height));
+    let mut rgba = Vec::with_capacity(width * height * PIXEL_SIZE);
+    for y in 0..height {
+        let row = y * GRID / height;
+        for x in 0..width {
+            let col = x * GRID / width;
+            let badge = row
+                .checked_sub(BADGE_Y)
+                .and_then(|row| BADGE.get(row))
+                .and_then(|row| row.get(col.checked_sub(BADGE_X)?));
+            let arrow = ARROW.get(row).and_then(|row| row.get(col));
+            let pixel = match badge.or(arrow) {
+                Some(b'#') => [0, 0, 0, 255],
+                Some(b'.') => [255, 255, 255, 255],
+                _ => [0; 4],
+            };
+            rgba.extend_from_slice(&pixel);
+        }
+    }
+    rgba
+}
+
 #[derive(Debug, Clone)]
 pub enum SelectedCursor {
     Named(CursorIcon),
@@ -247,5 +339,36 @@ impl Drop for RaiiCursor {
 impl RaiiCursor {
     pub fn as_raw_handle(&self) -> HICON {
         self.handle
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_pointer_badge_remains_visible_when_scaled() {
+        for scale in [1usize, 2] {
+            let side = 32 * scale;
+            let rgba = copy_cursor_rgba(side as u16, side as u16);
+            let pixel = |x: usize, y: usize| {
+                let index = (y * side + x) * scale * PIXEL_SIZE;
+                &rgba[index..index + PIXEL_SIZE]
+            };
+            assert_eq!(rgba.len(), side * side * PIXEL_SIZE);
+            assert_eq!(pixel(0, 0), [0, 0, 0, 255]);
+            assert_eq!(pixel(18, 18), [0, 0, 0, 255]);
+            assert_eq!(pixel(16, 15), [255, 255, 255, 255]);
+            assert_eq!(pixel(31, 31), [0, 0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn named_copy_cursor_reuses_its_native_handle() {
+        let copy = load_named_cursor(CursorIcon::Copy);
+        assert!(!copy.is_null());
+        assert_ne!(copy, load_named_cursor(CursorIcon::Default));
+        assert_ne!(copy, load_named_cursor(CursorIcon::NoDrop));
+        assert_eq!(copy, load_named_cursor(CursorIcon::Copy));
     }
 }

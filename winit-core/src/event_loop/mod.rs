@@ -353,6 +353,9 @@ pub trait ActiveEventLoop: Any + fmt::Debug {
     ///
     /// Returns `NotSupported` if the backend cannot restrict the destination.
     /// Currently implemented by the Win32, AppKit and X11 backends.
+    ///
+    /// On Win32, a drag without an image uses the existing mouse capture.
+    /// Start it from a mouse-button gesture in the source window.
     fn start_internal_drag(
         &self,
         source: WindowId,

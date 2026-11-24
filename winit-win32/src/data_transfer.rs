@@ -519,6 +519,15 @@ impl FileDropHandler {
         custom_formats: &[CustomDragFormat],
         send_event: Box<dyn Fn(WindowEvent)>,
     ) -> FileDropHandler {
+        let custom_formats: Vec<_> = custom_formats
+            .iter()
+            .filter_map(|format| Some((custom_drag_format_id(format)?, format.clone())))
+            .collect();
+        runner
+            .data_transfer()
+            .local_targets
+            .borrow_mut()
+            .insert(WindowId::from_raw(window.addr()), custom_formats.clone());
         let data = Box::new(FileDropHandlerData {
             interface: IDropTarget { lpVtbl: &DROP_TARGET_VTBL as *const IDropTargetVtbl },
             refcount: AtomicUsize::new(1),
@@ -526,10 +535,7 @@ impl FileDropHandler {
             runner,
             send_event,
             active_data_transfer_id: None,
-            custom_formats: custom_formats
-                .iter()
-                .filter_map(|format| Some((custom_drag_format_id(format)?, format.clone())))
-                .collect(),
+            custom_formats,
             drop_target_helper: None,
             active_drop_target_helper: None,
         });
@@ -634,37 +640,16 @@ impl FileDropHandler {
 
         let wid = WindowId::from_raw(drop_handler.window.addr());
 
-        // Local custom-only drags have no file, text or image payload to
-        // probe. Their formats are negotiated by metadata below.
-        let data = if source.is_none_or(|source| source.has_standard_formats) {
-            unsafe { DataObject::from_idataobject(pDataObj) }.unwrap_or_default()
-        } else {
-            DataObject::default()
+        // SAFETY: DragEnter provides a live data object for this offer.
+        unsafe {
+            drop_handler.runner.data_transfer().register_drag(
+                data_transfer_id,
+                wid,
+                pDataObj,
+                &drop_handler.custom_formats,
+                source.is_none_or(|source| source.has_standard_formats),
+            )
         };
-        let data = Arc::new(data);
-        let (custom_formats, object) =
-            if drop_handler.custom_formats.is_empty() || pDataObj.is_null() {
-                (Vec::new(), None)
-            } else {
-                // SAFETY: DragEnter supplies the IDataObject used for the drag.
-                let object = Rc::new(unsafe { IncomingDataObject::retain(pDataObj) });
-                let formats: Vec<_> = drop_handler
-                    .custom_formats
-                    .iter()
-                    .filter(|(native, _)| object.has_format(*native))
-                    .cloned()
-                    .collect();
-                let object = (!formats.is_empty()).then_some(object);
-                (formats, object)
-            };
-        drop_handler.runner.data_transfer().register_drag(DragState {
-            id: data_transfer_id,
-            window_id: wid,
-            data,
-            actions: Vec::new(),
-            custom_formats,
-            object,
-        });
 
         let pt_screen = POINT { x: pt.x, y: pt.y };
         let mut pt_client = pt_screen;
@@ -916,7 +901,7 @@ pub(crate) fn drop_effect_to_dnd_action(effect: DropEffect) -> Option<DndAction>
 }
 
 // Intersect the app's valid actions with the source's allowed effects, honoring Ctrl/Shift.
-fn pick_effect(actions: &[DndAction], key_state: u32, source_allowed: u32) -> u32 {
+pub(crate) fn pick_effect(actions: &[DndAction], key_state: u32, source_allowed: u32) -> u32 {
     const MK_SHIFT: u32 = 0x0004;
     const MK_CONTROL: u32 = 0x0008;
 
@@ -1050,13 +1035,72 @@ impl ClipboardState {
 #[derive(Debug, Default)]
 pub(crate) struct DataTransferState {
     drag: RefCell<Option<DragState>>,
+    local_targets: RefCell<HashMap<WindowId, Vec<(u16, CustomDragFormat)>>>,
     clipboard: RefCell<Option<ClipboardState>>,
     owns_clipboard: Cell<bool>,
 }
 
 impl DataTransferState {
-    fn register_drag(&self, state: DragState) {
-        self.drag.replace(Some(state));
+    unsafe fn register_drag(
+        &self,
+        id: DataTransferId,
+        window_id: WindowId,
+        ptr: *const IDataObject,
+        formats: &[(u16, CustomDragFormat)],
+        has_standard_formats: bool,
+    ) {
+        // SAFETY: The caller owns or borrows the data object for this offer.
+        let data = if has_standard_formats && !ptr.is_null() {
+            unsafe { DataObject::from_idataobject(ptr) }.unwrap_or_default()
+        } else {
+            DataObject::default()
+        };
+        let (custom_formats, object) = if formats.is_empty() || ptr.is_null() {
+            (Vec::new(), None)
+        } else {
+            let object = Rc::new(unsafe { IncomingDataObject::retain(ptr) });
+            let custom_formats: Vec<_> =
+                formats.iter().filter(|(native, _)| object.has_format(*native)).cloned().collect();
+            let object = (!custom_formats.is_empty()).then_some(object);
+            (custom_formats, object)
+        };
+        self.drag.replace(Some(DragState {
+            id,
+            window_id,
+            data: Arc::new(data),
+            actions: Vec::new(),
+            custom_formats,
+            object,
+        }));
+    }
+
+    pub(crate) fn remove_local_target(&self, window: WindowId) {
+        self.local_targets.borrow_mut().remove(&window);
+    }
+
+    pub(crate) fn is_local_target(&self, window: WindowId) -> bool {
+        self.local_targets.borrow().contains_key(&window)
+    }
+
+    pub(crate) fn register_local_drag(
+        &self,
+        id: DataTransferId,
+        window_id: WindowId,
+        source: &SourceDataObject,
+    ) {
+        let Some(formats) = self.local_targets.borrow().get(&window_id).cloned() else {
+            return;
+        };
+        // SAFETY: The source owns a live same-thread data object.
+        unsafe {
+            self.register_drag(
+                id,
+                window_id,
+                source.interface_ptr().cast(),
+                &formats,
+                source.has_standard_formats(),
+            )
+        };
     }
 
     pub(crate) fn read_custom_drag(
@@ -2288,6 +2332,35 @@ mod custom_drag_tests {
         assert_eq!(reads.load(Ordering::SeqCst), 0);
         assert_eq!(incoming.read_bytes(native), Some(bytes));
         assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn local_transfer_follows_the_registered_target_and_expires_on_leave() {
+        let format = CustomDragFormat::new("org.example.local-transfer-test").unwrap();
+        let native = custom_drag_format_id(&format).unwrap();
+        let source = SourceDataObject::for_drag(
+            DataTransferSendBuilder::new(vec![1, 0, 0])
+                .with_type(format.clone(), |bytes, _| Some(bytes.clone()))
+                .build(),
+        );
+        let transfers = DataTransferState::default();
+        let id = next_data_transfer_id();
+        let unregistered = WindowId::from_raw(1);
+        let registered = WindowId::from_raw(2);
+
+        transfers.register_local_drag(id, unregistered, &source);
+        assert!(transfers.drag_state(id).is_none());
+        transfers.local_targets.borrow_mut().insert(registered, vec![(native, format.clone())]);
+        transfers.register_local_drag(id, registered, &source);
+        assert_eq!(transfers.drag_state(id).unwrap().window_id, registered);
+        let (target, payload) = transfers.read_custom_drag(id, &format).unwrap();
+        assert_eq!(target, registered);
+        assert_eq!(payload.try_as_bytes().unwrap(), [1, 0, 0]);
+        transfers.remove_drag(id);
+        assert!(matches!(
+            transfers.read_custom_drag(id, &format),
+            Err(TransferError::UnknownTransfer(expired)) if expired == id
+        ));
     }
 
     #[test]
