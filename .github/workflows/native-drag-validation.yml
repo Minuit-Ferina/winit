@@ -2,13 +2,14 @@ name: Native drag validation
 
 on:
   push:
-    branches: [codex/winit-native-drag-validation]
+    branches: [codex/winit-native-drag-validation, codex/winit-native-drag-macos26]
 
 permissions:
   contents: read
 
 jobs:
   x11:
+    if: github.ref_name == 'codex/winit-native-drag-validation'
     name: X11 native drag contract
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -24,7 +25,7 @@ jobs:
 
   macos:
     name: AppKit native drag contract
-    runs-on: macos-15
+    runs-on: ${{ github.ref_name == 'codex/winit-native-drag-macos26' && 'macos-26' || 'macos-15' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
