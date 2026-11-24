@@ -347,12 +347,15 @@ pub trait ActiveEventLoop: Any + fmt::Debug {
 
     /// Start a native drag limited to destinations in this application.
     ///
-    /// The OS feedback and final drop must reject external windows. The
+    /// External windows cannot receive the application data. The
     /// destination still selects an action and validates the received data.
     /// This does not make the format name secret.
     ///
     /// Returns `NotSupported` if the backend cannot restrict the destination.
-    /// Currently implemented by the Win32, AppKit and X11 backends.
+    /// Currently implemented by the Win32, AppKit, X11 and Wayland backends.
+    ///
+    /// On Wayland, only registered custom formats can be transferred. The
+    /// compositor controls cursor feedback and whether Escape cancels the gesture.
     ///
     /// On Win32, a drag without an image uses the existing mouse capture.
     /// Start it from a mouse-button gesture in the source window.

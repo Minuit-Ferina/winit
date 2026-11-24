@@ -818,7 +818,31 @@ impl RootActiveEventLoop for ActiveEventLoop {
         action_mask: &[DndAction],
         icon: Option<DragIcon>,
     ) -> Result<DataTransferId, TransferError> {
-        self.state.borrow_mut().start_drag(&self.queue_handle, source, send_data, action_mask, icon)
+        self.state.borrow_mut().start_drag(
+            &self.queue_handle,
+            source,
+            send_data,
+            action_mask,
+            icon,
+            false,
+        )
+    }
+
+    fn start_internal_drag(
+        &self,
+        source: WindowId,
+        send_data: Box<dyn DataTransferSend>,
+        action_mask: &[DndAction],
+        icon: Option<DragIcon>,
+    ) -> Result<DataTransferId, TransferError> {
+        self.state.borrow_mut().start_drag(
+            &self.queue_handle,
+            source,
+            send_data,
+            action_mask,
+            icon,
+            true,
+        )
     }
 
     fn clipboard(&self) -> Result<Option<DataTransferId>, TransferError> {

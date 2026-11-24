@@ -1,11 +1,13 @@
 //! Types related to data transfer (drag-and-drop and clipboard).
 
-use std::collections::hash_map::Entry;
+use std::collections::hash_map::{Entry, RandomState};
+use std::hash::BuildHasher;
 use std::ffi::OsStr;
 use std::io::{self, BufRead, Cursor, ErrorKind, Write};
 use std::ops::{BitOr, Deref};
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
+use std::time::Instant;
 use std::{fmt, mem};
 
 use calloop::{PostAction, RegistrationToken};
@@ -40,7 +42,7 @@ use wayland_client::protocol::wl_shm::Format;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Proxy, QueueHandle};
 use winit_core::data_transfer::{
-    CustomDragFormat, DataTransfer, DataTransferId, DataTransferSend, SendData, TransferType, TypeHint, TypedData,
+    CustomDragFormat, DataTransfer, DataTransferId, DataTransferLimits, DataTransferSend, SendData, TransferType, TypeHint, TypedData,
 };
 use winit_core::error::{NotSupportedError, TransferError};
 use winit_core::event::WindowEvent;
@@ -599,10 +601,11 @@ impl WinitState {
         type_: &dyn TransferType,
         limits: Option<winit_core::data_transfer::DataTransferLimits>,
     ) -> Result<AsyncRequestSerial, TransferError> {
-        if limits
-            .is_some_and(|limits| std::time::Instant::now().checked_add(limits.timeout).is_none())
-        {
-            return Err(TransferError::Failed);
+        let deadline = limits
+            .map(|limits| Instant::now().checked_add(limits.timeout).ok_or(TransferError::Failed))
+            .transpose()?;
+        if let Some(result) = self.fetch_internal_drag(id, type_, limits, deadline) {
+            return result;
         }
         let Some(session) = self.data_transfer_state.session_mut(id) else {
             return Err(TransferError::UnknownTransfer(id));
@@ -703,6 +706,46 @@ impl WinitState {
         session.start_fetch(mime_type_str, writefd, async_request_serial);
 
         Ok(async_request_serial)
+    }
+
+    fn fetch_internal_drag(
+        &mut self,
+        id: DataTransferId,
+        type_: &dyn TransferType,
+        limits: Option<DataTransferLimits>,
+        deadline: Option<Instant>,
+    ) -> Option<Result<AsyncRequestSerial, TransferError>> {
+        let state = &mut self.data_transfer_state;
+        let session = state
+            .drags
+            .values_mut()
+            .chain(state.finishing_drags.iter_mut())
+            .find(|drag| drag.data.transfer_id() == id)?;
+        let offer = session.internal.as_ref()?;
+        let source = state.send_drag.as_ref().filter(|drag| drag.data_transfer_id == offer.source);
+        let (Some(source), Some(format)) = (source, type_.custom_drag_format()) else {
+            return Some(Err(TransferError::Failed));
+        };
+        let Some(mime_type) = session.data.find_type_dyn(format).cloned() else {
+            return Some(Err(TransferError::Failed));
+        };
+
+        let bytes = source.data.data_for_type(format);
+        let result = match bytes {
+            _ if deadline.is_some_and(|deadline| Instant::now() >= deadline) => {
+                Err(io::Error::new(ErrorKind::TimedOut, "transfer deadline expired"))
+            },
+            Some(SendData::Bytes(bytes)) => Ok(bytes),
+            _ => Err(io::Error::new(ErrorKind::InvalidData, "expected custom drag bytes")),
+        };
+        let serial = AsyncRequestSerial::get();
+        let mut fetch = DataFetch::new(id, serial, mime_type, session.window_id);
+        if let Some(limits) = limits {
+            fetch.max_bytes = limits.max_bytes;
+        }
+        session.fetches.insert(serial);
+        fetch.complete(result.map_err(Arc::new), self);
+        Some(Ok(serial))
     }
 
     pub(crate) fn data_transfer(
@@ -807,6 +850,15 @@ impl DataSourceHandler for WinitState {
         mime: String,
         fd: WritePipe,
     ) {
+        if self
+            .data_transfer_state
+            .send_drag
+            .as_ref()
+            .is_some_and(|drag| drag.data_source.inner() == source && drag.internal.is_some())
+        {
+            // The native offer only negotiates the action. Never send application bytes to its fd.
+            return;
+        }
         let Some(data) = self.data_transfer_state.send_data_mut(source) else {
             // TODO: Is there a way to explicitly express that the data was not sent?
             return;
@@ -833,16 +885,36 @@ impl DataSourceHandler for WinitState {
             return;
         };
 
-        let window_id = current_drag.window_id;
-        let id = current_drag.data_transfer_id;
-
-        self.events_sink.push_window_event(WindowEvent::OutgoingDragCanceled { id }, window_id);
+        if current_drag.internal.is_some_and(|internal| internal.dropped) {
+            return;
+        }
+        self.events_sink.push_window_event(
+            WindowEvent::OutgoingDragCanceled { id: current_drag.data_transfer_id },
+            current_drag.window_id,
+        );
     }
 
-    fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {
-        let Some(current_drag) = self.data_transfer_state.send_drag() else {
+    fn dnd_dropped(&mut self, conn: &Connection, qh: &QueueHandle<Self>, source: &WlDataSource) {
+        let state = &mut self.data_transfer_state;
+        let Some(current_drag) =
+            state.send_drag.as_ref().filter(|drag| drag.data_source.inner() == source)
+        else {
             return;
         };
+        if let Some(internal) = &current_drag.internal {
+            // External targets can accept the transport marker. Only our receiving window
+            // can confirm an internal drop. A foreign drop has already left any local target.
+            let local_target = state.drags.get(&internal.device).is_some_and(|session| {
+                session
+                    .internal
+                    .as_ref()
+                    .is_some_and(|offer| offer.source == current_drag.data_transfer_id)
+            });
+            if !internal.dropped && !local_target {
+                DataSourceHandler::cancelled(self, conn, qh, source);
+            }
+            return;
+        }
 
         let window_id = current_drag.window_id;
         let id = current_drag.data_transfer_id;
@@ -857,23 +929,34 @@ impl DataSourceHandler for WinitState {
         );
     }
 
-    fn dnd_finished(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wayland_client::protocol::wl_data_source::WlDataSource,
-    ) {
-        self.data_transfer_state.clear_send_drag();
+    fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
+        if let Some(drag) =
+            self.data_transfer_state.send_drag.take_if(|drag| drag.data_source.inner() == source)
+        {
+            if drag.internal.is_some_and(|internal| !internal.dropped) {
+                self.events_sink.push_window_event(
+                    WindowEvent::OutgoingDragCanceled { id: drag.data_transfer_id },
+                    drag.window_id,
+                );
+            }
+        }
     }
 
     fn action(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &WlDataSource,
+        source: &WlDataSource,
         action: WlDndAction,
     ) {
-        self.data_transfer_state.set_target_drag_action(action);
+        if let Some(drag) = self
+            .data_transfer_state
+            .send_drag
+            .as_mut()
+            .filter(|drag| drag.data_source.inner() == source)
+        {
+            drag.selected_action = action;
+        }
     }
 }
 
@@ -1040,6 +1123,7 @@ impl Deref for OfferHandle {
 #[derive(Debug)]
 struct DragSession {
     offer: OfferHandle,
+    internal: Option<InternalOffer>,
     data: DataOffer,
     window_id: WindowId,
     source_actions: WlDndAction,
@@ -1049,6 +1133,12 @@ struct DragSession {
     received: bool,
     fetches: HashSet<AsyncRequestSerial>,
     phase: Phase,
+}
+
+#[derive(Debug)]
+struct InternalOffer {
+    source: DataTransferId,
+    marker: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1067,6 +1157,7 @@ impl DragSession {
     ) -> Self {
         Self {
             offer,
+            internal: None,
             data,
             window_id,
             source_actions,
@@ -1112,8 +1203,9 @@ impl DragSession {
         // application can accept further types by fetching the data, but
         // this will at least mean that waiting until the drop to start
         // fetching data won't prevent the drop from working at all.
-        let accepted_type =
-            preferred_action.and(self.data.first_mime_type()).map(|mime| mime.to_string());
+        let accepted_type = preferred_action.and(self.data.first_mime_type()).map(|mime| {
+            self.internal.as_ref().map_or_else(|| mime.to_string(), |offer| offer.marker.clone())
+        });
         self.accepted = accepted_type.is_some();
         self.offer.accept(self.offer.serial, accepted_type);
     }
@@ -1149,6 +1241,7 @@ impl DragSession {
 #[derive(Debug)]
 pub struct DragSource {
     data_transfer_id: DataTransferId,
+    internal: Option<InternalDrag>,
     data_source: SctkDragSource,
     data: Box<dyn DataTransferSend>,
     selected_action: WlDndAction,
@@ -1156,23 +1249,11 @@ pub struct DragSource {
     _icon: Option<Surface>,
 }
 
-impl DragSource {
-    fn new(
-        data_transfer_id: DataTransferId,
-        data_source: SctkDragSource,
-        data: Box<dyn DataTransferSend>,
-        icon: Option<Surface>,
-        window_id: WindowId,
-    ) -> Self {
-        Self {
-            data_transfer_id,
-            data_source,
-            data,
-            selected_action: WlDndAction::None,
-            window_id,
-            _icon: icon,
-        }
-    }
+#[derive(Debug)]
+struct InternalDrag {
+    device: ObjectId,
+    marker: String,
+    dropped: bool,
 }
 
 impl WinitState {
@@ -1183,25 +1264,24 @@ impl WinitState {
         send_data: Box<dyn DataTransferSend>,
         action_mask: &[DndAction],
         icon: Option<DragIcon>,
+        internal: bool,
     ) -> Result<DataTransferId, TransferError> {
+        if internal
+            && (self.data_transfer_state.send_drag.is_some()
+                || !send_data.available_types().iter().any(|ty| ty.custom_drag_format().is_some()))
+        {
+            return Err(TransferError::Failed);
+        }
         let dnd_actions = action_mask
             .iter()
             .copied()
             .map(dnd_action_winit_to_wl)
             .fold(WlDndAction::empty(), BitOr::bitor);
 
-        let mime_types = send_data.available_types().into_iter().flat_map(|ty| {
-            let custom =
-                ty.custom_drag_format().map(|format| MimeType::parse(format.drag_mime_type()));
-            custom.into_iter().chain(MimeType::from_dyn(ty))
-        });
-
         let data_device_manager = self
             .data_device_manager_state
             .as_ref()
             .ok_or(NotSupportedError::new("Tried to initiate drag, but data device not enabled"))?;
-        let data_source =
-            data_device_manager.create_drag_and_drop_source(queue_handle, mime_types, dnd_actions);
 
         let icon_surface = icon.and_then(|icon| {
             let rgba = icon.icon.cast_ref::<RgbaIcon>()?;
@@ -1247,13 +1327,40 @@ impl WinitState {
             .latest_button_serial()
             .unwrap_or_default();
 
+        let device = data_device.inner().id();
+        let transfer_id = make_data_transfer_id(device.clone(), serial);
+        // The marker ties the receiving offer to this gesture on this seat.
+        // Application formats and bytes are exchanged only in process.
+        let internal = internal.then(|| InternalDrag {
+            device,
+            marker: format!(
+                "application/x-winit-internal-drag;token={:016x}",
+                RandomState::new().hash_one(serial)
+            ),
+            dropped: false,
+        });
+        let offered: Vec<String> = match &internal {
+            Some(drag) => vec![drag.marker.clone()],
+            None => send_data
+                .available_types()
+                .into_iter()
+                .flat_map(|ty| {
+                    let custom = ty
+                        .custom_drag_format()
+                        .map(|format| MimeType::parse(format.drag_mime_type()));
+                    custom.into_iter().chain(MimeType::from_dyn(ty))
+                })
+                .map(|mime| mime.to_string())
+                .collect(),
+        };
+        let data_source =
+            data_device_manager.create_drag_and_drop_source(queue_handle, offered, dnd_actions);
         data_source.start_drag(
             data_device,
             window.window.wl_surface(),
             icon_surface.as_ref().map(Surface::wl_surface),
             serial,
         );
-        let transfer_id = make_data_transfer_id(data_device.inner().id(), serial);
 
         // For some reason, if we commit before starting the drag then the offset isn't applied.
         // This doesn't seem to be documented anywhere, and it's possible that it's a bug in KDE.
@@ -1261,8 +1368,15 @@ impl WinitState {
             surface.wl_surface().commit();
         }
 
-        self.data_transfer_state.send_drag =
-            Some(DragSource::new(transfer_id, data_source, send_data, icon_surface, source));
+        self.data_transfer_state.send_drag = Some(DragSource {
+            data_transfer_id: transfer_id,
+            internal,
+            data_source,
+            data: send_data,
+            selected_action: WlDndAction::None,
+            window_id: source,
+            _icon: icon_surface,
+        });
 
         Ok(transfer_id)
     }
@@ -1293,22 +1407,6 @@ impl DataTransferState {
                 self.finishing_drags.push(session);
             }
         }
-    }
-
-    fn send_drag(&self) -> Option<&DragSource> {
-        self.send_drag.as_ref()
-    }
-
-    fn set_target_drag_action(&mut self, action: WlDndAction) {
-        if let Some(source) = &mut self.send_drag {
-            source.selected_action = action;
-        }
-    }
-
-    /// Returns `true` if a drag operation was in progress, `false` if no drag operation was in
-    /// progress.
-    fn clear_send_drag(&mut self) -> bool {
-        self.send_drag.take().is_some()
     }
 }
 
@@ -1369,20 +1467,43 @@ impl DataDeviceHandler for WinitState {
         let device = data_device.id();
         let window_id = crate::make_wid(wl_surface);
 
-        let mut view = drag.with_mime_types(|types| {
-            DataOffer::new(types, make_data_transfer_id(device.clone(), drag.serial))
-        });
+        let id = make_data_transfer_id(device.clone(), drag.serial);
         let window = self.windows.borrow().get(&window_id).cloned();
         let window = window.as_ref().map(|window| window.lock().unwrap());
         let custom_formats =
             window.as_ref().map(|window| &window.custom_drag_formats[..]).unwrap_or_default();
+        let (mut view, internal) = drag.with_mime_types(|types| {
+            let local = self.data_transfer_state.send_drag.as_ref().and_then(|source| {
+                let local = source.internal.as_ref()?;
+                (local.device == device && types.contains(&local.marker)).then_some((source, local))
+            });
+            match local {
+                Some((source, local)) => {
+                    let mime_types = source
+                        .data
+                        .available_types()
+                        .into_iter()
+                        .filter_map(TransferType::custom_drag_format)
+                        .map(|format| MimeType::parse(format.drag_mime_type()))
+                        .collect();
+                    let view = DataOffer { mime_types, transfer_id: id };
+                    (
+                        view,
+                        Some(InternalOffer {
+                            source: source.data_transfer_id,
+                            marker: local.marker.clone(),
+                        }),
+                    )
+                },
+                None => (DataOffer::new(types, id), None),
+            }
+        });
         view.retain_custom_drag_formats(custom_formats);
         drop(window);
         let offer = OfferHandle { data: drag.inner().clone(), serial: drag.serial };
 
-        let id = view.transfer_id();
-
         let mut session = DragSession::new(offer, view, window_id, drag.source_actions);
+        session.internal = internal;
         session.set_actions(&[]);
 
         if let Some(old) = self.data_transfer_state.drags.insert(device, session) {
@@ -1497,6 +1618,25 @@ impl DataDeviceHandler for WinitState {
             return;
         };
 
+        if let Some(offer) = &session.internal {
+            let Some(source) = self
+                .data_transfer_state
+                .send_drag
+                .as_mut()
+                .filter(|source| source.data_transfer_id == offer.source && session.accepted)
+            else {
+                return;
+            };
+            let Some(internal) = source.internal.as_mut() else { return };
+            internal.dropped = true;
+            self.events_sink.push_window_event(
+                WindowEvent::OutgoingDragDropped {
+                    id: source.data_transfer_id,
+                    action: dnd_action_wl_to_winit(session.selected_action),
+                },
+                source.window_id,
+            );
+        }
         session.phase = Phase::Dropped;
 
         self.events_sink.push_window_event(
