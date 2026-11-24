@@ -1,0 +1,54 @@
+name: Native drag validation
+
+on:
+  push:
+    branches: [codex/winit-native-drag-validation]
+
+permissions:
+  contents: read
+
+jobs:
+  x11:
+    name: X11 native drag contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth xdotool libxi6 libxkbcommon-x11-0 libxcursor1 libxrandr2
+      - run: |
+          xvfb-run -a -s '-screen 0 1280x800x24' cargo test -p winit-x11 \
+            --test outgoing_drag native_internal_drag_contract -- --ignored --nocapture
+
+  macos:
+    name: AppKit native drag contract
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build -p winit --example custom_drag_format
+      - name: Package the Apple Silicon demo
+        run: |
+          app="$RUNNER_TEMP/Winit Drag Test.app"
+          mkdir -p "$app/Contents/MacOS"
+          cp target/debug/examples/custom_drag_format "$app/Contents/MacOS/custom_drag_format"
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleIdentifier string org.example.winit-drag-validation' \
+            -c 'Add :CFBundleName string Winit Drag Test' \
+            -c 'Add :CFBundleExecutable string custom_drag_format' \
+            -c 'Add :CFBundlePackageType string APPL' "$app/Contents/Info.plist"
+          codesign --force --sign - "$app"
+          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/winit-drag-macos-arm64.zip"
+      - name: Exercise the three native gestures
+        run: bash .github/validation/appkit-drag.sh
+      - name: Upload the demo and native logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: winit-drag-macos-arm64
+          path: |
+            ${{ runner.temp }}/winit-drag-macos-arm64.zip
+            ${{ runner.temp }}/winit-drag-logs/
+          retention-days: 7

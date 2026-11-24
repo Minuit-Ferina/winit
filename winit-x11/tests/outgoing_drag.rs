@@ -17,6 +17,7 @@ use winit_x11::ActiveEventLoopExtX11 as _;
 use x11rb::connection::Connection as _;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{self, ConnectionExt as _};
+use x11rb::wrapper::ConnectionExt as _;
 
 const PAYLOAD: &str = "winit XDND source";
 const CUSTOM_PAYLOAD: &[u8] = &[1, 0, 2, 0];
@@ -28,8 +29,7 @@ fn custom_format() -> CustomDragFormat {
 #[test]
 #[ignore = "requires a disposable X11 display and xdotool"]
 fn completes_and_cancels_drags_between_x11_windows() {
-    let mut events = winit_x11::EventLoop::new().unwrap();
-    for scenario in [
+    run_cases(&[
         Scenario::Copy,
         Scenario::CopyAcrossGap,
         Scenario::CopyAcrossOverlap,
@@ -39,7 +39,23 @@ fn completes_and_cancels_drags_between_x11_windows() {
         Scenario::CustomReject,
         Scenario::Escape,
         Scenario::Copy,
-    ] {
+    ]);
+}
+
+#[test]
+#[ignore = "requires a disposable X11 display and xdotool"]
+fn native_internal_drag_contract() {
+    run_cases(&[
+        Scenario::CustomCopy,
+        Scenario::CustomExternalReject,
+        Scenario::CustomEscape,
+        Scenario::CustomCopy,
+    ]);
+}
+
+fn run_cases(cases: &[Scenario]) {
+    let mut events = winit_x11::EventLoop::new().unwrap();
+    for &scenario in cases {
         let mut app = DragTest {
             scenario,
             source: None,
@@ -60,6 +76,7 @@ fn completes_and_cancels_drags_between_x11_windows() {
             if scenario == Scenario::CustomCopy { CUSTOM_PAYLOAD } else { PAYLOAD.as_bytes() };
         assert_eq!(app.received.as_deref(), copied.then_some(expected), "{scenario:?}");
         assert_eq!(app.outcome, Some(copied), "{scenario:?}");
+        eprintln!("{scenario:?}: passed");
     }
 }
 
@@ -72,6 +89,8 @@ enum Scenario {
     Reject,
     CustomCopy,
     CustomReject,
+    CustomExternalReject,
+    CustomEscape,
     Escape,
 }
 
@@ -88,7 +107,10 @@ impl Scenario {
     }
 
     fn custom(self) -> bool {
-        matches!(self, Self::CustomCopy | Self::CustomReject)
+        matches!(
+            self,
+            Self::CustomCopy | Self::CustomReject | Self::CustomExternalReject | Self::CustomEscape
+        )
     }
 
     fn target_x(self) -> i32 {
@@ -118,7 +140,8 @@ impl ApplicationHandler for DragTest {
         let attributes = WindowAttributes::default()
             .with_decorations(false)
             .with_surface_size(PhysicalSize::new(180, 180));
-        let custom_formats = (self.scenario == Scenario::CustomCopy).then(custom_format);
+        let custom_formats =
+            (self.scenario.custom() && self.scenario != Scenario::CustomReject).then(custom_format);
         let destination = event_loop
             .create_window(
                 attributes
@@ -156,6 +179,7 @@ impl ApplicationHandler for DragTest {
                 false
             });
             assert!(windows_visible, "both test windows should be visible");
+            let external = (scenario == Scenario::CustomExternalReject).then(external_drop_target);
             let mut input = Command::new("xdotool");
             let target_x = scenario.target_x().to_string();
             input.args([
@@ -210,14 +234,32 @@ impl ApplicationHandler for DragTest {
                     "0.1",
                 ]);
             }
-            if scenario == Scenario::Escape {
+            if matches!(scenario, Scenario::Escape | Scenario::CustomEscape) {
                 input.args(["key", "Escape", "sleep", "0.05"]);
+            }
+            if external.is_some() {
+                input.args(["mousemove", "680", "90", "sleep", "0.18"]);
             }
             assert!(input.status().unwrap().success());
             if scenario == Scenario::CopyAcrossGap {
                 check_selection_during_hover();
             }
             assert!(Command::new("xdotool").args(["mouseup", "1"]).status().unwrap().success());
+            if let Some((conn, window)) = external {
+                let pointer = conn.query_pointer(window).unwrap().reply().unwrap();
+                assert!(
+                    pointer.win_x >= 0
+                        && pointer.win_x < 180
+                        && pointer.win_y >= 0
+                        && pointer.win_y < 180
+                );
+                while let Some(event) = conn.poll_for_event().unwrap() {
+                    assert!(
+                        !matches!(event, Event::ClientMessage(_)),
+                        "the external target got {event:?}"
+                    );
+                }
+            }
         }));
     }
 
@@ -317,6 +359,41 @@ impl ApplicationHandler for DragTest {
             event_loop.set_control_flow(ControlFlow::WaitUntil(self.deadline));
         }
     }
+}
+
+fn external_drop_target() -> (x11rb::rust_connection::RustConnection, xproto::Window) {
+    let (conn, screen) = x11rb::connect(None).unwrap();
+    let root = conn.setup().roots[screen].root;
+    let window = conn.generate_id().unwrap();
+    conn.create_window(
+        x11rb::COPY_DEPTH_FROM_PARENT,
+        window,
+        root,
+        600,
+        30,
+        180,
+        180,
+        0,
+        xproto::WindowClass::INPUT_OUTPUT,
+        x11rb::COPY_FROM_PARENT,
+        &xproto::CreateWindowAux::new().override_redirect(1),
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+    let xdnd_aware = conn.intern_atom(false, b"XdndAware").unwrap().reply().unwrap().atom;
+    conn.change_property32(
+        xproto::PropMode::REPLACE,
+        window,
+        xdnd_aware,
+        xproto::AtomEnum::ATOM,
+        &[5],
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+    conn.map_window(window).unwrap().check().unwrap();
+    (conn, window)
 }
 
 fn check_selection_during_hover() {
